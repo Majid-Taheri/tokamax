@@ -1507,6 +1507,7 @@ def chunk_kda_bwd_dAv_kernel(
     "chunk_size",
     "max_num_segments",
     "has_initial_state",
+    "per_channel_gate",
   ],
 )
 @jaxtyping.jaxtyped

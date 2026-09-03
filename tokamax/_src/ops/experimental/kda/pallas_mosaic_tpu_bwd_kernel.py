@@ -806,10 +806,10 @@ def fused_recompute_w_u_vnew_from_h_pallas(
 # Shared L1 helpers for the fused backward kernel
 # ══════════════════════════════════════════════════════════════════════════
 
-@partial(jax.jit, static_argnames=["precision"])
+@partial(jax.jit, static_argnames=["precision", "per_channel_gate"])
 def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
                            dq_acc, dk_acc, db_acc, dg_acc,
-                           precision):
+                           precision, per_channel_gate=True):
   BT = bq.shape[1]
   idx = jnp.arange(BT, dtype=jnp.int32)
   causal_mask = idx[:, None] >= idx[None, :]
@@ -836,12 +836,36 @@ def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
   dAkk_diag = jnp.stack(
     [dAkk_full[:, i * BC:(i + 1) * BC, i * BC:(i + 1) * BC] for i in range(NC)])
 
-  g_max = jnp.max(g_b, axis=2, keepdims=True)
-  row_d = jnp.exp2(g_b - g_max)
-  col_d = jnp.exp2(g_max - g_b)
-  k_til = k_b * col_d
-  q_hat = q_b * row_d
-  k_hat = k_b * beta_b * row_d
+  dAkk_diag_beta = None
+  if per_channel_gate:
+    # Re-centre on the block max so both halves stay representable. `col_d`
+    # still carries a positive exponent and overflows once the gate falls by
+    # more than ~128 in log2 across the BC rows of a block.
+    g_max = jnp.max(g_b, axis=2, keepdims=True)
+    row_d = jnp.exp2(g_b - g_max)
+    col_d = jnp.exp2(g_max - g_b)
+    k_til = k_b * col_d
+    q_hat = q_b * row_d
+    k_hat = k_b * beta_b * row_d
+  else:
+    # Scalar gate: row_d[r] * col_d[t] is exactly exp2(g[r] - g[t]), so form
+    # that difference once as a [BC, BC] matrix and fold it into the
+    # cotangents before contracting. Nothing is re-centred and nothing can
+    # overflow -- the exponent is <= 0 wherever the causal mask keeps it.
+    # Same regrouping as the forward's _scalar_gate_intra.
+    row_d = col_d = None
+    gs_b = g_b[:, :, :, 0]                                  # [NC, MB, BC]
+    _r = jax.lax.broadcasted_iota(jnp.int32, (BC, BC), dimension=0)
+    _c = jax.lax.broadcasted_iota(jnp.int32, (BC, BC), dimension=1)
+    _causal = (_r >= _c)[None, None]
+    _diff = gs_b[:, :, :, None] - gs_b[:, :, None, :]       # [NC, MB, BC, BC]
+    _decay = jnp.where(_causal, jnp.exp2(jnp.where(_causal, _diff, 0.0)), 0.0)
+    dAqk_diag = dAqk_diag * _decay
+    dAkk_diag = dAkk_diag * _decay
+    # beta indexes the contracted row in the dk_col term, matching
+    # `k_hat = k_b * beta_b * row_d` on the per-channel side.
+    dAkk_diag_beta = dAkk_diag * beta_b
+    k_til, q_hat, k_hat = k_b, q_b, k_b
 
   K = bq.shape[2]
   MB = bq.shape[0]
@@ -851,20 +875,24 @@ def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
   def _f(x):
     return x.reshape(NM, x.shape[2], x.shape[3])
 
-  dq_all = (_f(row_d) * jax.lax.dot_general(
+  _sc_row = (lambda x: _f(row_d) * x) if per_channel_gate else (lambda x: x)
+  _sc_col = (lambda x: _f(col_d) * x) if per_channel_gate else (lambda x: x)
+  _dAkk_col = dAkk_diag if per_channel_gate else dAkk_diag_beta
+
+  dq_all = _sc_row(jax.lax.dot_general(
     _f(dAqk_diag), _f(k_til), _b1,
     preferred_element_type=jnp.float32, precision=precision,
   )).reshape(NC, MB, BC, K)
-  dk_row_pre_all = (_f(row_d) * jax.lax.dot_general(
+  dk_row_pre_all = _sc_row(jax.lax.dot_general(
     _f(dAkk_diag), _f(k_til), _b1,
     preferred_element_type=jnp.float32, precision=precision,
   )).reshape(NC, MB, BC, K)
-  dk_col_all = (_f(col_d) * (
+  dk_col_all = _sc_col(
     jax.lax.dot_general(_f(dAqk_diag), _f(q_hat), _b1t,
                         preferred_element_type=jnp.float32, precision=precision)
-    + jax.lax.dot_general(_f(dAkk_diag), _f(k_hat), _b1t,
+    + jax.lax.dot_general(_f(_dAkk_col), _f(k_hat), _b1t,
                           preferred_element_type=jnp.float32, precision=precision)
-  )).reshape(NC, MB, BC, K)
+  ).reshape(NC, MB, BC, K)
 
   row_pairs = [(ii, ij) for ii in range(NC) for ij in range(ii)]
   if row_pairs:
@@ -996,6 +1024,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   NT,
   scale,
   MB,
+  per_channel_gate=True,
 ):
   """Fuse Dhu, WY, intra backward, and reverse cumsum for one chunk tile."""
   head_group = pl.program_id(0)
@@ -1050,7 +1079,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   # --- Intra backward + reverse cumsum ---
   dq_total, dk_total, db_total, dg_total = compute_intra_backward(
     bq, bk, bg, bb, bdAqk, dAkk_local, dq_acc, dk_acc, db_acc, dg_acc,
-    precision=precision,
+    precision=precision, per_channel_gate=per_channel_gate,
   )
   dg_reverse_cumsum = compute_reverse_cumsum_dg(dg_total)
 
@@ -1074,6 +1103,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
       "mini_batch",
       "return_dh0",
       "max_num_segments",
+      "per_channel_gate",
   ],
 )
 @jaxtyping.jaxtyped
@@ -1098,6 +1128,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   segment_ids: Int[Array, "B T"] | None = None,
   chunk_size: int = 64,
   use_exp2: bool = True,
+  per_channel_gate: bool = True,
   mini_batch: int | None = None,
   return_dh0: bool = True,
   max_num_segments: int | None = None,
@@ -1196,6 +1227,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   kernel = partial(
     _fused_dhu_wy_intra_cumsum_kernel,
     scale=scale,
+    per_channel_gate=per_channel_gate,
     BT=BT,
     K=K,
     V=V,
@@ -1493,6 +1525,8 @@ def chunk_kda_bwd_custom(
         Float[Array, "H B T_ORIG V"],
         Float[Array, "B H K V"] | Float[Array, "B N H K V"] | None,
     ],
+    *,
+    per_channel_gate: bool = True,
 ) -> tuple[
     Float[Array, "H B T_ORIG K"],
     Float[Array, "H B T_ORIG K"],
@@ -1796,6 +1830,7 @@ def chunk_kda_bwd_custom(
     dht = dht[:, None, :, :, :]
   dht_m4 = dht
   dq, dk, dv, db, dg, dh0 = _fused_dhu_wy_intra_cumsum_pallas_jit(
+      per_channel_gate=per_channel_gate,
     q=q,
     k=k,
     v=v,

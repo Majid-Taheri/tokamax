@@ -492,9 +492,6 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     # kernel consumes the aligned and optionally L2-normalized copies retained
     # in `residuals`. Reusing these arguments would skip that preprocessing.
     del out, query, key, value, gate, beta, output_final_state, return_residuals
-    # Stage 2 lands later in this series: until then the backward keeps the
-    # per-channel factorization, and so keeps the overflow.
-    del per_channel_gate
     chunk_size = config.chunk_size
     # The forward residual set records the selected policy: a retained hidden
     # state means backward can use the saved-state path; otherwise it must
@@ -523,6 +520,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         initial_state is not None,
         residuals,
         dout,
+        per_channel_gate=per_channel_gate,
     )
 
     grads = {

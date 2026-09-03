@@ -55,6 +55,19 @@ for _p in ("tokamax._src.ops.experimental.kda.api",
 if api is None:
   sys.exit("KDA op not importable. Tried:\n  " + "\n  ".join(_errs))
 
+# Upstream restricts the KDA Mosaic kernel to TPU generation >= 6:
+#   supported_on() -> device.platform == "tpu" and generation >= 6
+# The branch this work started from had no such guard, which is why it ran on
+# v5. Set KDA_BYPASS_DEVICE_CHECK=1 to test on older hardware anyway. Do that
+# knowingly: the numerics here are hardware-independent, but performance
+# numbers from an unsupported generation mean nothing.
+if _os.environ.get("KDA_BYPASS_DEVICE_CHECK") == "1":
+  import dataclasses as _dc
+  for _name, _op in list(api.IMPLEMENTATIONS.items()):
+    api.IMPLEMENTATIONS[_name] = _dc.replace(_op, bypass_device_check=True)
+  print("NOTE: device check bypassed (KDA_BYPASS_DEVICE_CHECK=1)")
+
+
 import inspect
 _HAS_FLAG = "per_channel_gate" in inspect.signature(
     api.kimi_delta_attention).parameters

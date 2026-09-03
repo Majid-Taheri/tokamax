@@ -25,6 +25,7 @@ import math
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax import lax
 
 
 def l2norm(x, dim=-1, eps=1e-6):

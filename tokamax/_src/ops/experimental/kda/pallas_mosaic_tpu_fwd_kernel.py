@@ -733,6 +733,12 @@ def _fused_gate_intra_kernel(
   else:
     g_cumsum = g_f32
 
+  # Narrow in HBM, wide in VMEM. `g_cumsum_store` keeps the width the output
+  # ref expects; everything downstream uses the widened copy.
+  g_cumsum_store = g_cumsum
+  if g_cumsum.shape[-1] != K:
+    g_cumsum = jnp.broadcast_to(g_cumsum, g_cumsum.shape[:-1] + (K,))
+
   q_f32 = q.astype(jnp.float32)
   k_f32 = k.astype(jnp.float32)
   beta_f32 = beta.astype(jnp.float32)
@@ -858,7 +864,7 @@ def _fused_gate_intra_kernel(
   kg_out_ref[:, 0, 0] = kg.astype(kg_out_ref.dtype)
   Aqk_out_ref[:, 0, 0] = Aqk.astype(Aqk_out_ref.dtype)
   Akk_inv_out_ref[:, 0, 0] = A_inv.astype(Akk_inv_out_ref.dtype)
-  g_cumsum_out_ref[:, 0, 0] = g_cumsum
+  g_cumsum_out_ref[:, 0, 0] = g_cumsum_store
 
 
 def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
@@ -1167,7 +1173,9 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   # Reference-point stabilization mirrors the production varlen kernel's
   # g_ref = g[0] choice for bit-identical numerics.
   b_q = q_ref[:,0,:]                              # [MB, BT, K]
-  b_g = gk_ref[:,0,:].astype(jnp.float32)         # [MB, BT, K]
+  b_g = gk_ref[:,0,:].astype(jnp.float32)         # [MB, BT, GW]
+  if b_g.shape[-1] != b_q.shape[-1]:                # widen a scalar gate in VMEM
+    b_g = jnp.broadcast_to(b_g, b_g.shape[:-1] + (b_q.shape[-1],))
   b_A = A_ref[:,0,:]                               # [MB, BT, BT]
 
   b_g_ref_row = b_g[:, 0:1, :]                # [MB, 1, K]

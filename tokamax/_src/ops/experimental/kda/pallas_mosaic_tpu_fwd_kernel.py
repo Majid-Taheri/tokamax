@@ -586,6 +586,64 @@ def _solve_unit_lower_triangular_neumann_batched(A, b):
 # Fused gate cumsum and intra-chunk solve
 # =============================================================================
 
+def _scalar_gate_intra(q_f32, k_f32, g_cumsum, beta_f32, *, BT: int, scale: float):
+  """Intra-chunk Aqk and L for a per-head scalar gate (Gated Delta Net).
+
+  The per-channel path has to fold the gate into the k contraction, which
+  forces it to split `exp2(g[r] - g[t])` into two factors around a reference
+  row. That split is where the kernel loses numerical range: each factor can
+  reach 2^+-inf on its own even though their product is always <= 1.
+
+  With a scalar gate the decay does not depend on the key channel, so it comes
+  out of the sum entirely:
+
+      Aqk[m,r,t] = exp2(g[m,r] - g[m,t]) * sum_k q[m,r,k] * k[m,t,k]
+
+  The exponent is now a single difference, masked to the causal half where it
+  is guaranteed <= 0, so exp2 lands in (0, 1] and cannot overflow. Under the
+  mask the two forms are algebraically identical -- this is a regrouping, not
+  an approximation.
+
+  Args:
+    q_f32: [MB, BT, K] queries.
+    k_f32: [MB, BT, K] keys.
+    g_cumsum: [MB, BT, K] chunk-local cumulative gate in log2 space. Every
+      channel holds the same value; channel 0 is read.
+    beta_f32: [MB, BT, 1] delta-rule write strength.
+    BT: chunk size.
+    scale: query scale, applied to Aqk only.
+
+  Returns:
+    `(Aqk, L)`, both [MB, BT, BT], causal- and strict-lower-masked to match
+    the per-channel path exactly.
+  """
+  gs = g_cumsum[:, :, 0]                                       # [MB, BT]
+  row = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
+  col = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
+  causal = row >= col
+  strict = row > col
+
+  # Masked before exp2, so the anti-causal half never produces a positive
+  # exponent. Those entries are discarded by the mask below anyway.
+  diff = gs[:, :, None] - gs[:, None, :]                       # [MB, BT, BT]
+  decay = jnp.exp2(jnp.where(causal[None], diff, jnp.float32(0.0)))
+
+  qk = jax.lax.dot_general(
+    q_f32, k_f32, (((2,), (2,)), ((0,), (0,))),
+    preferred_element_type=jnp.float32,
+  )                                                            # [MB, BT, BT]
+  kk = jax.lax.dot_general(
+    k_f32, k_f32, (((2,), (2,)), ((0,), (0,))),
+    preferred_element_type=jnp.float32,
+  )                                                            # [MB, BT, BT]
+
+  zero = jnp.float32(0.0)
+  Aqk = jnp.where(causal[None], qk * decay * scale, zero)
+  # beta indexes the row, matching `Akk_row = qk_dot[:, BC:] * beta_i`.
+  L = jnp.where(strict[None], kk * decay * beta_f32, zero)
+  return Aqk, L
+
+
 def _fused_gate_intra_kernel(
   q_ref,
   k_ref,
@@ -610,6 +668,7 @@ def _fused_gate_intra_kernel(
   fuse_cumsum: bool,
   disable_recompute: bool,
   safe_gate: bool,
+  per_channel_gate: bool,
   use_gate_in_kernel: bool,
   lower_bound: float | None,
   mini_batch: int = 1,
@@ -689,6 +748,19 @@ def _fused_gate_intra_kernel(
   #
   # Use broadcasted_iota for 2D indices to avoid Mosaic-unsupported i1
   # shape casts (e.g. (BT,) -> (BT, 1) on bool tensors).
+  #
+  # A scalar gate (`per_channel_gate=False`, i.e. Gated Delta Net) does not
+  # need any of this. When every key channel carries the same decay, the gate
+  # is independent of k and factors straight out of the contraction:
+  #
+  #   Aqk[m,r,t] = exp2(g[m,r] - g[m,t]) * sum_k q[m,r,k] * k[m,t,k]
+  #
+  # so the matmul runs ungated and a [BT, BT] decay matrix is applied after.
+  # That is both cheaper -- no exp over [BT, K], no gated copies of q and k --
+  # and numerically safe: the exponent is formed as a single difference that
+  # is <= 0 everywhere the causal mask keeps it, instead of being split into
+  # exp2(g[r] - ref) * exp2(ref - g[t]) whose two halves can independently
+  # overflow to inf and underflow to 0. See _scalar_gate_intra below.
   ref_idx = BC // 2 if safe_gate else 0
   row_iota_bt_k = jax.lax.broadcasted_iota(jnp.int32, (BT, K), dimension=0)
   row_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), dimension=0)
@@ -696,7 +768,7 @@ def _fused_gate_intra_kernel(
 
   Aqk_rows = []
   L_rows = []
-  for i_sc in range(NC):
+  for i_sc in range(NC) if per_channel_gate else ():
     i_s = i_sc * BC
     q_i = q_f32[:, i_s : i_s + BC]       # [MB, BC, K]
     k_i = k_f32[:, i_s : i_s + BC]       # [MB, BC, K]
@@ -739,8 +811,14 @@ def _fused_gate_intra_kernel(
     Aqk_rows.append(Aqk_row)
     L_rows.append(Akk_row)
 
-  Aqk = jnp.concatenate(Aqk_rows, axis=1).astype(dtype)  # [MB, BT, BT]
-  L = jnp.concatenate(L_rows, axis=1)                     # [MB, BT, BT]
+  if per_channel_gate:
+    Aqk = jnp.concatenate(Aqk_rows, axis=1).astype(dtype)  # [MB, BT, BT]
+    L = jnp.concatenate(L_rows, axis=1)                     # [MB, BT, BT]
+  else:
+    Aqk, L = _scalar_gate_intra(
+      q_f32, k_f32, g_cumsum, beta_f32, BT=BT, scale=scale
+    )
+    Aqk = Aqk.astype(dtype)
 
   # --- Solve (I + L) x = rhs ---
   v_beta = v.astype(jnp.float32) * beta_f32          # [MB, BT, V]
@@ -797,6 +875,7 @@ def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
     "chunk_size",
     "scale",
     "safe_gate",
+    "per_channel_gate",
     "disable_recompute",
     "cumsum_scale",
     "use_gate_in_kernel",
@@ -814,6 +893,7 @@ def pallas_kda_fwd_intra_fused(
   scale: float,
   chunk_size: int = 64,
   safe_gate: bool = True,
+  per_channel_gate: bool = True,
   disable_recompute: bool = False,
   cumsum_scale: float = RCP_LN2,
   a_log: Float[Array, "H"] | None = None,
@@ -893,6 +973,7 @@ def pallas_kda_fwd_intra_fused(
       fuse_cumsum=True,
       disable_recompute=disable_recompute,
       safe_gate=safe_gate,
+      per_channel_gate=per_channel_gate,
       use_gate_in_kernel=use_gate_in_kernel,
       lower_bound=lower_bound,
       mini_batch=MB,
@@ -957,6 +1038,7 @@ def kda_fwd_intra_fused(
   chunk_size: int = 64,
   chunk_indices: jax.Array | None = None,
   safe_gate: bool = True,
+  per_channel_gate: bool = True,
   disable_recompute: bool = False,
   cumsum_scale: float = RCP_LN2,
   a_log: jax.Array | None = None,
@@ -980,7 +1062,8 @@ def kda_fwd_intra_fused(
   return pallas_kda_fwd_intra_fused(
     q=q, k=k, v=v, g=g, beta=beta,
     scale=scale, chunk_size=chunk_size,
-    safe_gate=safe_gate, disable_recompute=disable_recompute,
+    safe_gate=safe_gate, per_channel_gate=per_channel_gate,
+    disable_recompute=disable_recompute,
     cumsum_scale=cumsum_scale,
     a_log=a_log, delta_time_bias=delta_time_bias,
     use_gate_in_kernel=use_gate_in_kernel,
@@ -1438,6 +1521,7 @@ def chunk_kda_fwd_custom(
     use_gate_in_kernel: bool = False,
     segment_ids: Int[Array, "B T"] | None = None,
     safe_gate: bool = True,
+    per_channel_gate: bool = True,
     lower_bound: float | None = None,
     disable_recompute: bool = True,
     context_parallel_metadata: ContextParallelMetadata | None = None,
@@ -1497,6 +1581,7 @@ def chunk_kda_fwd_custom(
     chunk_size=BT,
     chunk_indices=chunk_indices,
     safe_gate=safe_gate,
+    per_channel_gate=per_channel_gate,
     disable_recompute=save_for_backward,
     cumsum_scale=RCP_LN2,
     a_log=a_log,

@@ -911,7 +911,7 @@ def pallas_kda_fwd_intra_fused(
     Float[Array, "H B T K"],
     Float[Array, "H B T BT"],
     Float[Array, "H B T BT"],
-    Float[Array, "H B T K"],
+    Float[Array, "H B T GW"],
 ]:
   """Fuses gate cumsum with the fixed-length intra-chunk solve.
 

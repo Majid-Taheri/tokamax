@@ -27,15 +27,17 @@ CHUNK = 64
 NAMES = ("d_query", "d_key", "d_value", "d_gate", "d_beta")
 
 api = None
+_errs = []
 for _p in ("tokamax._src.ops.experimental.kda.api",
            "tokamax.ops.experimental.kda.api"):
   try:
     api = __import__(_p, fromlist=["api"])
     break
-  except ImportError:
+  except ImportError as e:
+    _errs.append(f'{_p}: {e}')
     continue
 if api is None:
-  sys.exit("KDA op not importable.")
+  sys.exit("KDA op not importable. Tried:\n  " + "\n  ".join(_errs))
 
 
 def inputs(a_max, width):

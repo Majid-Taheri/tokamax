@@ -34,15 +34,17 @@ ITERS = int(os.environ.get("KDA_ITERS", "10"))
 DTYPE = {"f32": jnp.float32, "bf16": jnp.bfloat16}[os.environ.get("KDA_DTYPE", "bf16")]
 
 api = None
+_errs = []
 for _p in ("tokamax._src.ops.experimental.kda.api",
            "tokamax.ops.experimental.kda.api"):
   try:
     api = __import__(_p, fromlist=["api"])
     break
-  except ImportError:
+  except ImportError as e:
+    _errs.append(f'{_p}: {e}')
     continue
 if api is None:
-  sys.exit("KDA op not importable.")
+  sys.exit("KDA op not importable. Tried:\n  " + "\n  ".join(_errs))
 
 import inspect
 _HAS_FLAG = "per_channel_gate" in inspect.signature(

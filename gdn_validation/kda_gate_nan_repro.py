@@ -70,6 +70,7 @@ LN2 = 0.6931471805599453
 # tree uses a different one, add it here -- everything else in this file is
 # plain JAX and does not care where the op came from.
 api = None
+_errs = []
 _tried = ("tokamax._src.ops.experimental.kda.api",
           "tokamax.ops.experimental.kda.api",
           "tokamax.experimental.kda.api")
@@ -78,7 +79,8 @@ for _path in _tried:
     api = __import__(_path, fromlist=["api"])
     print(f"KDA api imported from: {_path}")
     break
-  except ImportError:
+  except ImportError as e:
+    _errs.append(f'{_p}: {e}')
     continue
 if api is None:
   sys.exit("Could not import the KDA op. Tried:\n  " + "\n  ".join(_tried) +

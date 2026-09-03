@@ -1146,7 +1146,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   Float[Array, "H B T K"],
   Float[Array, "H B T V"],
   Float[Array, "H B T"],
-  Float[Array, "H B T K"],
+  Float[Array, "H B T GW"],
   Float[Array, "B N_OUT H K V"] | None,
 ]:
   """Fuses Dhu recurrence, WY backward, intra backward, and gate cumsum.
@@ -1543,7 +1543,7 @@ def chunk_kda_bwd_custom(
     Float[Array, "H B T_ORIG K"],
     Float[Array, "H B T_ORIG K"],
     Float[Array, "H B T_ORIG V"],
-    Float[Array, "H B T_ORIG K"],
+    Float[Array, "H B T_ORIG GW"],
     Float[Array, "H B T_ORIG"],
     Float[Array, "H"] | None,
     Float[Array, "H*K"] | None,

@@ -1124,7 +1124,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   qg: Float[Array, "H B T K"],
   kg: Float[Array, "H B T K"],
   w: Float[Array, "H B T K"],
-  g: Float[Array, "H B T K"],
+  g: Float[Array, "H B T GW"],
   beta: Float[Array, "H B T"],
   A: Float[Array, "H B T BT"],
   h: Float[Array, "H B NT K V"],

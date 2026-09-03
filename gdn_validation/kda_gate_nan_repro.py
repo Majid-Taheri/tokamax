@@ -206,7 +206,7 @@ def backward_check(dtype, dtype_name):
           bits.append(f"{nm}={'NaN%d%%' % (100 * bad // gr.size) if bad else 'ok'}")
         print(f"    {impl:<7} " + "  ".join(bits))
       except Exception as e:  # noqa: BLE001
-        print(f"    {impl:<7} RAISED {type(e).__name__}: {str(e)[:70]}")
+        print(f"    {impl:<7} RAISED {type(e).__name__}: {str(e).replace(chr(10), ' | ')[:400]}")
 
 
 def main():

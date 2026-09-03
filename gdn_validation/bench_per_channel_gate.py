@@ -122,7 +122,7 @@ def timed(fn, args, label):
   try:
     jax.block_until_ready(fn(*args))
   except Exception as e:  # noqa: BLE001
-    return None, f"{type(e).__name__}: {str(e)[:60]}"
+    return None, f"{type(e).__name__}: {str(e).replace(chr(10), ' | ')[:400]}"
   ts = []
   for _ in range(ITERS):
     t0 = time.perf_counter()

@@ -115,7 +115,7 @@ def main():
         out = jax.block_until_ready(fn(*args))
         grads = jax.block_until_ready(jax.grad(loss(fn), argnums=argn)(*args))
       except Exception as e:  # noqa: BLE001
-        print(f"{tag}  RAISED {type(e).__name__}: {str(e)[:70]}")
+        print(f"{tag}  RAISED {type(e).__name__}: {str(e).replace(chr(10), ' | ')[:400]}")
         if not per_channel:
           ok = False
         continue

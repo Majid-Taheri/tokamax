@@ -69,6 +69,15 @@ LN2 = 0.6931471805599453
 # The KDA op has moved around; try the paths it is known to live under. If your
 # tree uses a different one, add it here -- everything else in this file is
 # plain JAX and does not care where the op came from.
+import os as _os
+# These scripts live in <repo>/gdn_validation/. Put the repo root on the path
+# so `import tokamax` resolves to the checkout directly, rather than through
+# the editable install's finder -- which reports tokamax._src as a namespace
+# package and then cannot find tokamax._src.jaxtyping.
+_repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _os.path.isdir(_os.path.join(_repo, "tokamax")) and _repo not in sys.path:
+  sys.path.insert(0, _repo)
+
 api = None
 _errs = []
 _tried = ("tokamax._src.ops.experimental.kda.api",

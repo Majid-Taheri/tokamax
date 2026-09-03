@@ -33,6 +33,15 @@ CHUNK = 64
 ITERS = int(os.environ.get("KDA_ITERS", "10"))
 DTYPE = {"f32": jnp.float32, "bf16": jnp.bfloat16}[os.environ.get("KDA_DTYPE", "bf16")]
 
+import os as _os
+# These scripts live in <repo>/gdn_validation/. Put the repo root on the path
+# so `import tokamax` resolves to the checkout directly, rather than through
+# the editable install's finder -- which reports tokamax._src as a namespace
+# package and then cannot find tokamax._src.jaxtyping.
+_repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _os.path.isdir(_os.path.join(_repo, "tokamax")) and _repo not in sys.path:
+  sys.path.insert(0, _repo)
+
 api = None
 _errs = []
 for _p in ("tokamax._src.ops.experimental.kda.api",

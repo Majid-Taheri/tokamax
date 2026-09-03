@@ -1049,6 +1049,11 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bkg = kg_ref[:, 0, 0]
   bw = w_ref[:, 0, 0].astype(jnp.float32)
   bg = g_ref[:, 0, 0].astype(jnp.float32)
+  # A scalar gate arrives one value wide to keep it out of HBM. Widen it
+  # here, inside VMEM, so the rest of the backward is unchanged.
+  _gate_narrow = bg.shape[-1] != K
+  if _gate_narrow:
+    bg = jnp.broadcast_to(bg, bg.shape[:-1] + (K,))
   g_exp_last = jnp.exp2(bg[:, BT - 1, :])
   bb = beta_ref[:, 0, 0, :, 0].astype(jnp.float32)
   bA = A_ref[:, 0, 0].astype(jnp.float32)
@@ -1087,6 +1092,10 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   dk_ref[:, 0, 0] = dk_total.astype(dk_ref.dtype)
   dv_ref[:, 0, 0] = (b_dvb * bb[:, :, None]).astype(dv_ref.dtype)
   db_ref[:, 0, 0, :, 0] = db_total.astype(db_ref.dtype)
+  # d(loss)/d(scalar gate) is the sum of the per-channel cotangents, since
+  # the one value feeds every channel.
+  if _gate_narrow:
+    dg_reverse_cumsum = jnp.sum(dg_reverse_cumsum, axis=-1, keepdims=True)
   dg_ref[:, 0, 0] = dg_reverse_cumsum.astype(dg_ref.dtype)
 
   @pl.when(is_first_chunk)
@@ -1198,7 +1207,8 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   qg_r = qg.reshape(H, B, NT, BT, K)
   kg_r = kg.reshape(H, B, NT, BT, K)
   w_r = w.reshape(H, B, NT, BT, K)
-  g_r = g.reshape(H, B, NT, BT, K)
+  GW = g.shape[-1]   # K for a per-channel gate, 1 for a scalar one
+  g_r = g.reshape(H, B, NT, BT, GW)
   beta_r = beta.reshape(H, B, NT, BT, 1)
   A_r = A.reshape(H, B, NT, BT, BT)
   h_r = h  # already [H, B, NT, K, V]
@@ -1218,6 +1228,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   dht_arr = dht_arr.transpose(2, 0, 1, 3, 4)
 
   qk_spec = pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk)
+  g_spec = pl.BlockSpec((MB, 1, 1, BT, GW), index_map=idx_chunk)
   v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
   b_spec = pl.BlockSpec((MB, 1, 1, BT, 1), index_map=idx_chunk)
   A_spec = pl.BlockSpec((MB, 1, 1, BT, BT), index_map=idx_chunk)
@@ -1240,7 +1251,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, BT, V), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, BT, 1), jnp.float32),
-    jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
+    jax.ShapeDtypeStruct((H, B, NT, BT, GW), jnp.float32),
     jax.ShapeDtypeStruct((H, B, N, K, V), jnp.float32),
   ]
 
@@ -1258,7 +1269,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         qk_spec,
         qk_spec,
         qk_spec,
-        qk_spec,
+        g_spec,
         b_spec,
         A_spec,
         h_spec,
@@ -1267,7 +1278,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         A_spec,
         state_spec,
       ],
-      out_specs=[qk_spec, qk_spec, v_spec, b_spec, qk_spec, state_spec],
+      out_specs=[qk_spec, qk_spec, v_spec, b_spec, g_spec, state_spec],
       scratch_shapes=[dh_tmp],
     ),
     compiler_params=pltpu.CompilerParams(
@@ -1301,7 +1312,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     dk_r.reshape(H, B, T, K),
     dv_r.reshape(H, B, T, V),
     db_r.reshape(H, B, T),
-    dg_r.reshape(H, B, T, K),
+    dg_r.reshape(H, B, T, GW),
     dh0_out,
   )
 
@@ -1683,13 +1694,19 @@ def chunk_kda_bwd_custom(
       raise ValueError(f"saved h has NT={h.shape[2]}, expected {NT}")
 
     # M1 fusion: recompute w/qg/kg + v_new in one kernel (no u HBM round-trip).
+    # This helper indexes the gate per key channel, so widen a scalar gate for
+    # it. Only the recompute path pays that; the main backward keeps it narrow.
+    g_wide = (
+      g if g.shape[-1] == q.shape[-1]
+      else jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
+    )
     w, qg, kg, v_new = fused_recompute_w_u_vnew_from_h_pallas(
       q=q,
       k=k,
       v=v,
       beta=beta,
       A=Akk,
-      g=g,
+      g=g_wide,
       h=h,
       chunk_size=BT,
     )

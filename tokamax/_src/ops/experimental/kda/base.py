@@ -84,7 +84,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       query: Float[Array, "H B T K"],
       key: Float[Array, "H B T K"],
       value: Float[Array, "H B T V"],
-      gate: Float[Array, "H B T K"],
+      gate: Float[Array, "H B T GW"],
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None = None,
@@ -132,6 +132,24 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
           "`max_num_segments` is required when `segment_ids` is provided "
           "without `initial_state`."
       )
+    gate_width = gate.shape[-1]
+    if per_channel_gate:
+      if gate_width != key_dim:
+        raise ValueError(
+            f"`gate` last dimension {gate_width} must equal the key dimension"
+            f" {key_dim} when `per_channel_gate=True`."
+        )
+    elif gate_width not in (1, key_dim):
+      raise ValueError(
+          f"`gate` last dimension {gate_width} must be 1 (one value per head"
+          f" and token) or {key_dim} when `per_channel_gate=False`."
+      )
+    if not per_channel_gate and use_gate_in_kernel:
+      raise ValueError(
+          "`use_gate_in_kernel=True` needs a per-channel gate:"
+          " `delta_time_bias` is per key channel."
+      )
+
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,
         a_log=a_log,
@@ -172,7 +190,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       query: Float[Array, "H B T K"],
       key: Float[Array, "H B T K"],
       value: Float[Array, "H B T V"],
-      gate: Float[Array, "H B T K"],
+      gate: Float[Array, "H B T GW"],
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None,

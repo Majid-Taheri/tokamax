@@ -710,6 +710,9 @@ def _fused_gate_intra_kernel(
   g_f32 = g.astype(jnp.float32)
 
   if use_gate_in_kernel:
+    # Only reachable with a per-channel gate: delta_time_bias is per key
+    # channel, so it cannot be applied to a width-1 gate.
+    assert per_channel_gate, "use_gate_in_kernel requires per_channel_gate=True"
     dt_b = delta_time_bias_ref[:, 0, 0, 0]        # [MB, K]
     g_f32 = g_f32 + dt_b[:, None, :]       # [MB, BT, K]
     A_val = a_log_ref[:, 0, 0, 0, 0]       # [MB]
@@ -888,7 +891,7 @@ def pallas_kda_fwd_intra_fused(
   q: Float[Array, "H B T K"],
   k: Float[Array, "H B T K"],
   v: Float[Array, "H B T V"],
-  g: Float[Array, "H B T K"],
+  g: Float[Array, "H B T GW"],
   beta: Float[Array, "H B T"],
   scale: float,
   chunk_size: int = 64,
@@ -933,7 +936,8 @@ def pallas_kda_fwd_intra_fused(
   # [H, B, T, K] -> [H, B, NC, BT, K]
   q_r = q.reshape(H, B, NC, BT, K)
   k_r = k.reshape(H, B, NC, BT, K)
-  g_r = g.reshape(H, B, NC, BT, K)
+  GW = g.shape[-1]   # K for a per-channel gate, 1 for a scalar one
+  g_r = g.reshape(H, B, NC, BT, GW)
   beta_r = beta.reshape(H, B, NC, BT, 1)
   v_r = v.reshape(H, B, NC, BT, V)
 
@@ -986,12 +990,12 @@ def pallas_kda_fwd_intra_fused(
       jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
       jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
       jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, K), jnp.float32),
+      jax.ShapeDtypeStruct((H, B, NC, BT, GW), jnp.float32),
     ],
     in_specs=[
       _make_spec(K),
       _make_spec(K),
-      _make_spec(K),
+      _make_spec(GW),
       _make_spec(1),
       _make_spec(V),
       _make_per_head_spec(1),
@@ -1004,7 +1008,7 @@ def pallas_kda_fwd_intra_fused(
       _make_spec(K),
       _make_spec(BT),
       _make_spec(BT),
-      _make_spec(K),
+      _make_spec(GW),
     ],
     grid=grid,
     compiler_params=pltpu.CompilerParams(
@@ -1022,7 +1026,7 @@ def pallas_kda_fwd_intra_fused(
   )
   Aqk_flat = Aqk_r.reshape(H, B, NC * BT, BT)
   Akk_flat = Akk_inv_r.reshape(H, B, NC * BT, BT)
-  g_cumsum_out = g_cumsum_r.reshape(H, B, T, K)
+  g_cumsum_out = g_cumsum_r.reshape(H, B, T, GW)
 
   return w_out, u_out, qg_out, kg_out, Aqk_flat, Akk_flat, g_cumsum_out
 
@@ -1325,9 +1329,10 @@ def chunk_kda_fwd_h_o_varlen(
       x = jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, dim_pad)))
     return x
 
+  GW = gk.shape[-1]   # K for a per-channel gate, 1 for a scalar one
   w_t  = _pad_kdim_then_t(w,  K_PADSIZE - K)
   kg_t = _pad_kdim_then_t(kg, K_PADSIZE - K)
-  gk_t = _pad_kdim_then_t(gk, K_PADSIZE - K)
+  gk_t = _pad_kdim_then_t(gk, (K_PADSIZE - K) if GW == K else 0)
   q_t  = _pad_kdim_then_t(q,  K_PADSIZE - K)
   u_t  = _pad_kdim_then_t(u,  V_ALIGNED - V)
 
@@ -1354,6 +1359,9 @@ def chunk_kda_fwd_h_o_varlen(
     return (h, b, c, 0)
 
   bspec_k = pl.BlockSpec([MB, 1, BT, K_PADSIZE], index_map=_t_index_map)
+  # Narrow when the gate is scalar; identical to bspec_k otherwise.
+  bspec_gk = pl.BlockSpec(
+    [MB, 1, BT, K_PADSIZE if GW == K else GW], index_map=_t_index_map)
   bspec_v = pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_t_index_map)
   bspec_a = pl.BlockSpec([MB, 1, BT, BT],        index_map=_A_index_map)
   bspec_h0 = (
@@ -1442,7 +1450,7 @@ def chunk_kda_fwd_h_o_varlen(
         bspec_k,   # w
         bspec_v,   # u
         bspec_k,   # kg
-        bspec_k,   # gk
+        bspec_gk,  # gk
         bspec_k,   # q
         bspec_a,   # A
         bspec_h0,  # h0

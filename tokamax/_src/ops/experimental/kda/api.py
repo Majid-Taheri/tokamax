@@ -46,7 +46,7 @@ def kimi_delta_attention(
     query: Float[Array, "H B T K"],
     key: Float[Array, "H B T K"],
     value: Float[Array, "H B T V"],
-    gate: Float[Array, "H B T K"],
+    gate: Float[Array, "H B T GW"],
     beta: Float[Array, "H B T"],
     *,
     a_log: Float[Array, "H"] | None = None,

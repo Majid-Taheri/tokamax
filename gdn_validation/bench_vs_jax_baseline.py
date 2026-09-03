@@ -134,6 +134,7 @@ def main():
   contenders = [
       ("jax + solve_triangular  (main)", jax_path(ref.jax_gdn_solve_triangular), D),
       ("jax + log-depth   (PR #4577)", jax_path(ref.jax_gdn_log_depth), D),
+      ("jax + log-depth, HIGHEST", jax_path(ref.jax_gdn_log_depth_hi), D),
       ("KDA per_channel_gate=True", kda_path(True, D), D),
       ("KDA per_channel_gate=False", kda_path(False, D), D),
       ("KDA scalar, width-1 gate", kda_path(False, 1), 1),

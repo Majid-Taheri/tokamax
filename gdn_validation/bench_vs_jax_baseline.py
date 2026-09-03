@@ -166,7 +166,7 @@ def main():
     tf, ef = timed(jax.jit(fn), args)
     tb, eb = timed(jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))), args)
     results[name] = (tf, tb)
-    if name.startswith("jax + log-depth"):
+    if name.startswith("jax + log-depth   (PR"):   # the PR row only
       base_f, base_b = tf, tb
 
     fs = f"{base_f / tf:.2f}x" if (tf and base_f) else "-"

@@ -122,7 +122,7 @@ def timed(fn, args):
   try:
     jax.block_until_ready(fn(*args))
   except Exception as e:  # noqa: BLE001
-    return None, f"{type(e).__name__}: {str(e).replace(chr(10), ' | ')[:90]}"
+    return None, f"{type(e).__name__}: {str(e).replace(chr(10), ' | ')[:300]}"
   ts = []
   for _ in range(ITERS):
     t0 = time.perf_counter()
@@ -163,6 +163,7 @@ def main():
   print("-" * 84)
 
   results = {}
+  failures = []
   base_f = base_b = None
   for name, fn, _w in contenders:
     try:
@@ -182,8 +183,16 @@ def main():
     fs = f"{base_f / tf:.2f}x" if (tf and base_f) else "-"
     bs = f"{base_b / tb:.2f}x" if (tb and base_b) else "-"
     print(f"{name:<32} {acc:>11} "
-          f"{(f'{tf:.2f} ms' if tf else (ef or '-')[:10]):>10} "
-          f"{(f'{tb:.2f} ms' if tb else (eb or '-')[:11]):>11} {fs:>7} {bs:>8}")
+          f"{(f'{tf:.2f} ms' if tf else 'FAILED'):>10} "
+          f"{(f'{tb:.2f} ms' if tb else 'FAILED'):>11} {fs:>7} {bs:>8}")
+    for label, err in (("fwd", ef), ("bwd", eb)):
+      if err:
+        failures.append(f"{name} [{label}]: {err}")
+
+  if failures:
+    print("\nfailures in full:")
+    for f in failures:
+      print(f"  {f}")
 
   print("\n'fwd x' and 'total x' are speedups over PR #4577; above 1.00x means")
   print("faster than the optimised JAX baseline. 'vs PR#4577' is max relative")

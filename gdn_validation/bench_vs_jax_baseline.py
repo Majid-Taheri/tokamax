@@ -24,6 +24,7 @@ answer is worthless. Shapes come from one shard of the training config;
 override with KDA_H / KDA_B / KDA_T / KDA_DTYPE / KDA_CHUNK / KDA_ITERS.
 """
 
+import inspect
 import os
 import statistics
 import sys

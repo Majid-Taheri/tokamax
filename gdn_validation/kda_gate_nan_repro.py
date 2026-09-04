@@ -89,7 +89,7 @@ for _path in _tried:
     print(f"KDA api imported from: {_path}")
     break
   except ImportError as e:
-    _errs.append(f'{_p}: {e}')
+    _errs.append(f'{_path}: {e}')
     continue
 if api is None:
   sys.exit("Could not import the KDA op. Tried:\n  " + "\n  ".join(_tried) +

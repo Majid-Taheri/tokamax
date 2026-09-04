@@ -273,9 +273,12 @@ def jax_gdn_solve_triangular(
     # Sequence is sharded over cp_axis, so a sequential scan over chunks is not
     # available. Fold the local chunks into one affine map, exchange those, then
     # replay locally from the correct incoming state. See kernels/attention/gdn_cp.py.
-    A_loc, B_loc = gdn_cp.compose_local(w_scan, u_scan, k_scan, g_scan)
-    h_in, final_h = gdn_cp.incoming_state(A_loc, B_loc, h_init, cp_axis)
-    _, o_chunks = lax.scan(scan_body, h_in, xs)
+    # MaxText's kernels/attention/gdn_cp.py is not vendored here: these
+    # harnesses never run context-parallel. Say so rather than raise NameError.
+    raise NotImplementedError(
+        "context parallelism needs maxtext.kernels.attention.gdn_cp, which "
+        "this standalone copy does not vendor. Run with cp_axis=None."
+    )
 
   # =========================================================================
   # STAGE 4: FINALIZATION
@@ -464,9 +467,12 @@ def jax_gdn_log_depth(
     # Sequence is sharded over cp_axis, so a sequential scan over chunks is not
     # available. Fold the local chunks into one affine map, exchange those, then
     # replay locally from the correct incoming state. See kernels/attention/gdn_cp.py.
-    A_loc, B_loc = gdn_cp.compose_local(w_scan, u_scan, k_scan, g_scan)
-    h_in, final_h = gdn_cp.incoming_state(A_loc, B_loc, h_init, cp_axis)
-    _, o_chunks = lax.scan(scan_body, h_in, xs)
+    # MaxText's kernels/attention/gdn_cp.py is not vendored here: these
+    # harnesses never run context-parallel. Say so rather than raise NameError.
+    raise NotImplementedError(
+        "context parallelism needs maxtext.kernels.attention.gdn_cp, which "
+        "this standalone copy does not vendor. Run with cp_axis=None."
+    )
 
   # =========================================================================
   # STAGE 4: FINALIZATION
@@ -655,9 +661,12 @@ def jax_gdn_log_depth_hi(
     # Sequence is sharded over cp_axis, so a sequential scan over chunks is not
     # available. Fold the local chunks into one affine map, exchange those, then
     # replay locally from the correct incoming state. See kernels/attention/gdn_cp.py.
-    A_loc, B_loc = gdn_cp.compose_local(w_scan, u_scan, k_scan, g_scan)
-    h_in, final_h = gdn_cp.incoming_state(A_loc, B_loc, h_init, cp_axis)
-    _, o_chunks = lax.scan(scan_body, h_in, xs)
+    # MaxText's kernels/attention/gdn_cp.py is not vendored here: these
+    # harnesses never run context-parallel. Say so rather than raise NameError.
+    raise NotImplementedError(
+        "context parallelism needs maxtext.kernels.attention.gdn_cp, which "
+        "this standalone copy does not vendor. Run with cp_axis=None."
+    )
 
   # =========================================================================
   # STAGE 4: FINALIZATION

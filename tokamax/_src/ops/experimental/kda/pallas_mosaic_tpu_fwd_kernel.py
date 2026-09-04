@@ -1059,7 +1059,12 @@ def kda_fwd_intra_fused(
   Returns:
       7-tuple: (w, u, qg, kg, Aqk, Akk, g_cumsum).
   """
-  assert chunk_size == 64, f"Expected chunk_size=64, got {chunk_size}"
+  assert per_channel_gate is False or chunk_size == 64, (
+    f"per-channel gate is validated at chunk_size=64 only; got {chunk_size}"
+  )
+  assert chunk_size in (16, 32, 64, 128, 256, 512), (
+    f"chunk_size must be a power of two in [16, 512]; got {chunk_size}"
+  )
 
   # The caller has already BT-aligned varlen inputs, so the same contiguous
   # fused kernel handles both fixed-length and variable-length batches.

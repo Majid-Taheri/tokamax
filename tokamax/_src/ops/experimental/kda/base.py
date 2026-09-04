@@ -95,6 +95,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       use_qk_l2norm: bool = False,
       use_gate_in_kernel: bool = False,
       per_channel_gate: bool = True,
+      chunk_size: int | None = None,
       segment_ids: Int[Array, "B T"] | None = None,
       lower_bound: float | None = None,
       context_parallel_metadata: ContextParallelMetadata | None = None,
@@ -176,6 +177,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         use_qk_l2norm=use_qk_l2norm,
         use_gate_in_kernel=use_gate_in_kernel,
         per_channel_gate=per_channel_gate,
+        chunk_size=chunk_size,
         segment_ids=segment_ids,
         lower_bound=lower_bound,
         context_parallel_metadata=context_parallel_metadata,
@@ -201,6 +203,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
       per_channel_gate: bool,
+      chunk_size: int | None,
       segment_ids: Int[Array, "B T"] | None,
       lower_bound: float | None,
       context_parallel_metadata: ContextParallelMetadataArg,
@@ -212,7 +215,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
     del config, return_residuals
     # The reference contracts the gate directly and never factors it, so
     # both groupings are the same computation here.
-    del per_channel_gate
+    del per_channel_gate, chunk_size   # reference chunks internally
     _validate_beta(beta)
     output = reference.kimi_delta_attention(
         query,

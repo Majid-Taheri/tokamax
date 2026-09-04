@@ -91,9 +91,18 @@ def jax_path(fn):
   return run
 
 
+# Only the scalar path can take a chunk size; a per-channel gate is pinned to
+# 64 upstream. Passing it for both would raise, so ask only when it is legal.
+_KDA_TAKES_CHUNK = "chunk_size" in inspect.signature(
+    api.kimi_delta_attention).parameters
+
+
 def kda_path(per_channel, width):
   """Same maths through KDA: transpose to head-first, gate to `width`."""
   hf = lambda x: jnp.transpose(x, (2, 0, 1, 3))
+  extra = {}
+  if _KDA_TAKES_CHUNK and not per_channel:
+    extra["chunk_size"] = CHUNK
   def run(q, key, v, g, beta, init):
     gh = jnp.transpose(g.astype(jnp.float32), (2, 0, 1))
     gate = jnp.broadcast_to(gh[..., None], gh.shape + (width,))
@@ -103,7 +112,7 @@ def kda_path(per_channel, width):
         initial_state=init.astype(jnp.float32)[:, None],
         output_final_state=True, use_gate_in_kernel=False,
         use_qk_l2norm=True, per_channel_gate=per_channel,
-        implementation="mosaic")
+        implementation="mosaic", **extra)
     return jnp.transpose(out, (1, 2, 0, 3))     # back to [B, T, H, D]
   return run
 
@@ -135,9 +144,9 @@ def main():
       ("jax + solve_triangular  (main)", jax_path(ref.jax_gdn_solve_triangular), D),
       ("jax + log-depth   (PR #4577)", jax_path(ref.jax_gdn_log_depth), D),
       ("jax + log-depth, HIGHEST", jax_path(ref.jax_gdn_log_depth_hi), D),
-      ("KDA per_channel_gate=True", kda_path(True, D), D),
-      ("KDA per_channel_gate=False", kda_path(False, D), D),
-      ("KDA scalar, width-1 gate", kda_path(False, 1), 1),
+      ("KDA per_channel=True  (chunk 64)", kda_path(True, D), D),
+      ("KDA per_channel=False (chunk %d)" % (CHUNK if _KDA_TAKES_CHUNK else 64), kda_path(False, D), D),
+      ("KDA width-1 gate      (chunk %d)" % (CHUNK if _KDA_TAKES_CHUNK else 64), kda_path(False, 1), 1),
   ]
 
   q, key, v, g, beta, init, _ = make()

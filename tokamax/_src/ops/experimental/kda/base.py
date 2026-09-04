@@ -150,6 +150,21 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
           "`use_gate_in_kernel=True` needs a per-channel gate:"
           " `delta_time_bias` is per key channel."
       )
+    # Validate the chunk size here, where the caller's actual request is still
+    # visible. Downstream the config coerces a per-channel gate back to 64, so
+    # a guard placed any later would silently accept a request it ignored.
+    if chunk_size is not None:
+      if chunk_size not in (16, 32, 64, 128, 256, 512):
+        raise NotImplementedError(
+            f"`chunk_size` must be a power of two in [16, 512]; got"
+            f" {chunk_size}."
+        )
+      if per_channel_gate and chunk_size != 64:
+        raise NotImplementedError(
+            "`chunk_size` other than 64 is only supported with a scalar gate"
+            " (`per_channel_gate=False`). Kimi Delta Attention is validated at"
+            f" 64 only; got {chunk_size}."
+        )
 
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,

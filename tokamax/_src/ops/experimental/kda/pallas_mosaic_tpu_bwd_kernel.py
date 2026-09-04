@@ -1190,6 +1190,17 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     per_head = io_per_head + io_per_head * 3 // 2
     hw = get_tpu_limits()
     vmem_budget = hw.vmem_limit_bytes
+    # The estimate above under-counts: at chunk 128 and real shapes the
+    # allocation still overflows VMEM even though io_per_head has grown 4x in
+    # its BT*BT terms. Scale the budget down with the chunk size rather than
+    # guessing at the missing term -- measured: 64 fits, 128 did not.
+    # KDA_BWD_VMEM_FRACTION lets this be tuned without a rebuild.
+    import os as _os  # pylint: disable=g-import-not-at-top
+    _frac = float(_os.environ.get("KDA_BWD_VMEM_FRACTION", "0") or 0)
+    if _frac > 0:
+      vmem_budget = int(vmem_budget * _frac)
+    elif BT > 64:
+      vmem_budget = (vmem_budget * 64) // BT
     MB = max(1, vmem_budget // per_head)
     MB = min(MB, H, 16)
     while H % MB != 0 and MB > 1:

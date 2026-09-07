@@ -1454,7 +1454,14 @@ def chunk_kda_bwd_dAv_kernel(
     in_bytes = (2 * BT * V + BT * BT) * elem_size
     out_bytes = (BT * BT * 4 + BT * V * 2)
     per_chunk = in_bytes + out_bytes
-    MB = estimate_mini_batch(per_chunk, total, max_mb=32)
+    # Mosaic packs the batch dimension of a `dot_general` into the tile, so the
+    # operand ends up MB*BT wide. The MXU is 128 wide, so anything past that is
+    # rejected outright -- MB=2 at BT=128 gives "Bad rhs type: 256, 256". VMEM
+    # alone does not catch this: a chip with more VMEM picks a *larger* MB and
+    # fails where a smaller one passed. Pin MB to 1 once BT is over 128/2.
+    # Kimi Delta Attention is fixed at BT=64 and keeps the old bound.
+    max_mb = 1 if BT > 64 else 32
+    MB = estimate_mini_batch(per_chunk, total, max_mb=max_mb)
   else:
     MB = mini_batch
     assert total % MB == 0, f"total={total} must be divisible by mini_batch={MB}"

@@ -1714,6 +1714,7 @@ def chunk_kda_bwd_custom(
     # M1 fusion: recompute w/qg/kg + v_new in one kernel (no u HBM round-trip).
     # This helper indexes the gate per key channel, so widen a scalar gate for
     # it. Only the recompute path pays that; the main backward keeps it narrow.
+    assert g is not None
     g_wide = (
       g if g.shape[-1] == q.shape[-1]
       else jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))

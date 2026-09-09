@@ -519,7 +519,11 @@ def _recompute_w_u_fwd(q, k, v, beta, A, gk, chunk_size):
   k_chunks = k.reshape(H * B * NT, BT, K)
   v_chunks = v.reshape(H * B * NT, BT, V)
   beta_chunks = beta.reshape(H * B * NT, BT, 1)
-  g_chunks = gk.reshape(H * B * NT, BT, K)
+  # The gate carries its own width: K per channel, 1 for a scalar gate. Keep
+  # it at that width and let the products below broadcast. Widening it to K
+  # would work too, but this is the path that exists to save memory, so
+  # materialising a 128x copy of the gate would defeat the point.
+  g_chunks = gk.reshape(H * B * NT, BT, gk.shape[-1])
   g_exp = jnp.exp2(g_chunks)
   precision = (
       None if q.dtype == jnp.bfloat16 else jax.lax.Precision.HIGHEST

@@ -871,7 +871,8 @@ def chunk_gated_delta_rule_fwd_h(
   w: Float[Array, "H B T K"],
   u: Float[Array, "H B T V"],
   g: Float[Array, "H B T"] | None = None,
-  gk: Float[Array, "H B T K"] | None = None,
+  # GW, not K: a scalar gate arrives at width 1 and broadcasts from there.
+  gk: Float[Array, "H B T GW"] | None = None,
   initial_state: (
       Float[Array, "N_STATE H K V"]
       | Float[Array, "B N_STATE H K V"]

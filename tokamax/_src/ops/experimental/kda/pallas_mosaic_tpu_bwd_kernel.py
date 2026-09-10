@@ -1053,13 +1053,17 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bkg = kg_ref[:, 0, 0]
   bw = w_ref[:, 0, 0].astype(jnp.float32)
   bg = g_ref[:, 0, 0].astype(jnp.float32)
+  # A scalar gate is stored without a trailing axis, to keep it off the minor
+  # dimension in HBM. Put it back here; everything below expects [MB, BT, GW].
+  if bg.ndim == 2:
+    bg = bg[..., None]
   # A scalar gate arrives one value wide to keep it out of HBM. Widen it
   # here, inside VMEM, so the rest of the backward is unchanged.
   _gate_narrow = bg.shape[-1] != K
   if _gate_narrow:
     bg = jnp.broadcast_to(bg, bg.shape[:-1] + (K,))
   g_exp_last = jnp.exp2(bg[:, BT - 1, :])
-  bb = beta_ref[:, 0, 0, :, 0].astype(jnp.float32)
+  bb = beta_ref[:, 0, 0].astype(jnp.float32)
   bA = A_ref[:, 0, 0].astype(jnp.float32)
   bh = h_ref[:, 0, 0].astype(jnp.float32)
   bdo = do_ref[:, 0, 0]
@@ -1095,12 +1099,15 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   dq_ref[:, 0, 0] = dq_total.astype(dq_ref.dtype)
   dk_ref[:, 0, 0] = dk_total.astype(dk_ref.dtype)
   dv_ref[:, 0, 0] = (b_dvb * bb[:, :, None]).astype(dv_ref.dtype)
-  db_ref[:, 0, 0, :, 0] = db_total.astype(db_ref.dtype)
+  db_ref[:, 0, 0] = db_total.astype(db_ref.dtype)
   # d(loss)/d(scalar gate) is the sum of the per-channel cotangents, since
   # the one value feeds every channel.
   if _gate_narrow:
     dg_reverse_cumsum = jnp.sum(dg_reverse_cumsum, axis=-1, keepdims=True)
-  dg_ref[:, 0, 0] = dg_reverse_cumsum.astype(dg_ref.dtype)
+  if dg_ref.ndim == 4:
+    dg_ref[:, 0, 0] = dg_reverse_cumsum[..., 0].astype(dg_ref.dtype)
+  else:
+    dg_ref[:, 0, 0] = dg_reverse_cumsum.astype(dg_ref.dtype)
 
   @pl.when(is_first_chunk)
   def _():
@@ -1223,8 +1230,17 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   kg_r = kg.reshape(H, B, NT, BT, K)
   w_r = w.reshape(H, B, NT, BT, K)
   GW = g.shape[-1]   # K for a per-channel gate, 1 for a scalar one
-  g_r = g.reshape(H, B, NT, BT, GW)
-  beta_r = beta.reshape(H, B, NT, BT, 1)
+  # Same reason as beta below: a minor axis of size 1 pads to 128 lanes.
+  # A per-channel gate is already 128 wide and stays as it is.
+  scalar_gate = GW == 1
+  g_r = g.reshape(H, B, NT, BT) if scalar_gate else g.reshape(H, B, NT, BT, GW)
+  # No trailing 1. TPU memory tiles the last two dimensions [8, 128], so a
+  # minor axis of size 1 is padded out to 128 lanes and 127 of every 128
+  # entries hold nothing -- 16 MiB of gate becomes 2 GiB of buffer. Leaving
+  # the axis off makes BT the minor one, which pads 64 -> 128 instead: 2x
+  # rather than 128x. beta is one number per token in both gate modes, so
+  # this is not specific to the scalar path.
+  beta_r = beta.reshape(H, B, NT, BT)
   A_r = A.reshape(H, B, NT, BT, BT)
   h_r = h  # already [H, B, NT, K, V]
   do_r = do.reshape(H, B, NT, BT, V)
@@ -1233,6 +1249,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
 
   def idx_chunk(head_group, batch, chunk, chunk_seg_ids_ref):
     return (head_group, batch, NT - 1 - chunk, 0, 0)
+
+  def idx_chunk_4d(head_group, batch, chunk, chunk_seg_ids_ref):
+    """Same walk, for the operands that carry no trailing axis."""
+    return (head_group, batch, NT - 1 - chunk, 0)
 
   def idx_state(head_group, batch, chunk, chunk_seg_ids_ref):
     chunk_id = NT - 1 - chunk
@@ -1243,9 +1263,12 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   dht_arr = dht_arr.transpose(2, 0, 1, 3, 4)
 
   qk_spec = pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk)
-  g_spec = pl.BlockSpec((MB, 1, 1, BT, GW), index_map=idx_chunk)
+  g_spec = (
+    pl.BlockSpec((MB, 1, 1, BT), index_map=idx_chunk_4d) if scalar_gate
+    else pl.BlockSpec((MB, 1, 1, BT, GW), index_map=idx_chunk)
+  )
   v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
-  b_spec = pl.BlockSpec((MB, 1, 1, BT, 1), index_map=idx_chunk)
+  b_spec = pl.BlockSpec((MB, 1, 1, BT), index_map=idx_chunk_4d)
   A_spec = pl.BlockSpec((MB, 1, 1, BT, BT), index_map=idx_chunk)
   h_spec = pl.BlockSpec((MB, 1, 1, K, V), index_map=idx_chunk)
   state_spec = pl.BlockSpec((MB, 1, 1, K, V), index_map=idx_state)
@@ -1265,8 +1288,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, BT, V), jnp.float32),
-    jax.ShapeDtypeStruct((H, B, NT, BT, 1), jnp.float32),
-    jax.ShapeDtypeStruct((H, B, NT, BT, GW), jnp.float32),
+    jax.ShapeDtypeStruct((H, B, NT, BT), jnp.float32),
+    jax.ShapeDtypeStruct((H, B, NT, BT), jnp.float32) if scalar_gate
+    else jax.ShapeDtypeStruct((H, B, NT, BT, GW), jnp.float32),
     jax.ShapeDtypeStruct((H, B, N, K, V), jnp.float32),
   ]
 

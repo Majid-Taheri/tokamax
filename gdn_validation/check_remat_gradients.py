@@ -74,6 +74,26 @@ def inputs(gate_width):
   )
 
 
+def xla_grads(*, gate_width, per_channel_gate):
+  """The XLA reference. Independent of every Mosaic block spec and tiling."""
+  args = inputs(gate_width)
+  op = dc.replace(api.IMPLEMENTATIONS["xla"], bypass_device_check=True)
+  cot = jax.random.normal(jax.random.PRNGKey(9), (H, B, T, V), jnp.float32)
+
+  def loss(query, key, value, gate, beta):
+    out, _ = op(
+        query, key, value, gate, beta,
+        a_log=None, delta_time_bias=None, scale=None,
+        initial_state=None, output_final_state=False,
+        use_qk_l2norm=True, use_gate_in_kernel=False,
+        per_channel_gate=per_channel_gate, chunk_size=BT,
+        segment_ids=None, lower_bound=None,
+        context_parallel_metadata=None)
+    return jnp.sum(out.astype(jnp.float32) * cot)
+
+  return jax.grad(loss, argnums=(0, 1, 2, 3, 4))(*args)
+
+
 def grads(*, gate_width, per_channel_gate, rematerialize):
   args = inputs(gate_width)
   cfg = pmt.Config(chunk_size=BT, rematerialize_for_backward=rematerialize)
@@ -109,16 +129,26 @@ def compare(label, *, gate_width, per_channel_gate, tol=2e-2):
   remat = grads(gate_width=gate_width, per_channel_gate=per_channel_gate,
                 rematerialize=True)
 
-  ok = True
+  # Both Mosaic paths share most of the backward, so comparing them to each
+  # other cannot catch a change that breaks both the same way. Anchor on XLA,
+  # which shares none of the block specs or tiling.
+  ref = xla_grads(gate_width=gate_width, per_channel_gate=per_channel_gate)
+  print("  vs XLA reference:")
+  for name, x, s in zip(ARG_NAMES, ref, saved):
+    e = rel(s, x)
+    print(f"    d_{name:<6} {e:.2e}{'' if e < tol else '   <- DISAGREES'}")
+  print("  rematerialize vs save:")
+
+  ok = all(rel(s, x) < tol for x, s in zip(ref, saved))
   for name, s, r in zip(ARG_NAMES, saved, remat):
     bad = int(jnp.sum(~jnp.isfinite(r.astype(jnp.float32))))
     if bad:
-      print(f"  d_{name:<6} NaN/Inf in {100.0 * bad / r.size:.0f}% of entries")
+      print(f"    d_{name:<6} NaN/Inf in {100.0 * bad / r.size:.0f}% of entries")
       ok = False
       continue
     e = rel(r, s)
     flag = "" if e < tol else "   <- DISAGREES"
-    print(f"  d_{name:<6} {e:.2e}{flag}")
+    print(f"    d_{name:<6} {e:.2e}{flag}")
     ok = ok and e < tol
   return ok
 

@@ -1773,6 +1773,7 @@ def chunk_kda_bwd_custom(
     # to have folded exp2(g_last - g) into the keys; `g` applies it to the
     # values inside the kernel. Same product either way, since the factor is
     # one number per token, so pass the plain keys on that path.
+    assert g is not None
     scalar_gate = g.shape[-1] == 1
     h, v_new, _ = chunk_gated_delta_rule_fwd_h(
       k=k if scalar_gate else kg,

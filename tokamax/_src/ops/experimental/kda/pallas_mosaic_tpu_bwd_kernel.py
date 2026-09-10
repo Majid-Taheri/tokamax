@@ -1763,11 +1763,23 @@ def chunk_kda_bwd_custom(
       raise RuntimeError("KDA recompute did not produce gated keys.")
 
     # chunk_gated_delta_rule_fwd_h expects [B,T,H,X]
+    # Two gate inputs, and a scalar gate belongs in the other one. `gk` decays
+    # each key channel by its own entry, so the kernel reads it K_PADSIZE wide
+    # -- a width-1 array is read past its end, and zero-padding it would be
+    # worse, since exp2(0) means "no decay" on every padded channel. `g` is the
+    # scalar form: the kernel reads column 0 and scales the whole state by it.
+    #
+    # They also place the per-token factor differently. `gk` expects the caller
+    # to have folded exp2(g_last - g) into the keys; `g` applies it to the
+    # values inside the kernel. Same product either way, since the factor is
+    # one number per token, so pass the plain keys on that path.
+    scalar_gate = g.shape[-1] == 1
     h, v_new, _ = chunk_gated_delta_rule_fwd_h(
-      k=kg,
+      k=k if scalar_gate else kg,
       w=w,
       u=u,
-      gk=g,
+      g=g[..., 0] if scalar_gate else None,
+      gk=None if scalar_gate else g,
       initial_state=initial_state,
       output_final_state=False,
       chunk_size=chunk_size,

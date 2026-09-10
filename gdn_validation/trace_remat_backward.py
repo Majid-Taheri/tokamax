@@ -19,6 +19,13 @@ We only trace: `jax.eval_shape` walks the forward and the custom backward and
 builds every intermediate shape, without emitting a Mosaic kernel. Shapes that
 disagree raise here exactly as they did on the cluster.
 
+What this does NOT catch: VMEM capacity. A block spec can be shaped
+correctly and still ask for more on-chip memory than the chip has, and that
+is decided by XLA on a real TPU, not here. The same recompute path also had
+one of those -- an output window that took the whole NT dimension, 64 MiB
+once double-buffered, against 64 MiB of VMEM. Shapes agree; it still will
+not compile. Only a TPU tells you that.
+
 Run with no arguments. Exits non-zero on the first shape error.
 """
 

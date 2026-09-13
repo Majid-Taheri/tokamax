@@ -80,7 +80,6 @@ import logging
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jax.ad_checkpoint import checkpoint_name
 
 _warned_chunk_size = False
 
@@ -233,21 +232,5 @@ def kda_chunk_gated_delta_rule(
   )
 
   core_attn_out = jnp.transpose(out, (1, 2, 0, 3))  # -> [B, S, H, V]
-
-  # MaxText runs this layer under `remat_policy=full`, so by default the whole
-  # forward is thrown away and recomputed during the backward. qwen3.py's
-  # `_get_gdn_aware_remat_policy` overrides that for a fixed set of names, and
-  # `gdn_core_attn_out` is already one of them -- the MaxKernel path tags its
-  # output with it. Tag ours the same way so both paths get the same treatment
-  # and a profile comparison is meaningful.
-  #
-  # This saves the *output*. Whether it also stops the forward custom call
-  # being re-executed is a separate question: this op is a `custom_vjp`, and
-  # its residuals (q, k, v, aqk, akk, h, g_cumsum, the rstds) are internal to
-  # that boundary, so no name outside it can reach them. If the profile still
-  # shows the forward running twice, that is the reason, and the fix has to be
-  # at the custom_vjp rather than here.
-  core_attn_out = checkpoint_name(core_attn_out, "gdn_core_attn_out")
-
   next_state = None if final_state is None else final_state[:, 0]  # drop N=1
   return core_attn_out.astype(query.dtype), next_state

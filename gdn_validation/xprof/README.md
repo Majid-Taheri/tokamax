@@ -61,10 +61,19 @@ it in the forward.
 
 ## The result that changed the plan
 
-Both arms recompute their own forward during the backward, and for the same
-reason: `checkpoint_name` tags placed inside a `shard_map` are invisible to
-the outer remat policy, so nothing the policy can see marks the residuals as
-worth keeping.
+Both arms recompute their own forward during the backward: a `custom_vjp`'s
+residuals carry no name, so a `save_only_these_names` policy has nothing to
+match and rebuilds them.
+
+> **Correction, 14 September.** This section first blamed `shard_map` for
+> hiding the names. That is wrong, and it was wrong in a way that would have
+> sent someone down the wrong path. Tested both ways
+> (`probe_kda_residual_saving.py`): with the residuals named and
+> `optimize_remat=False`, the forward is kept whether or not there is a
+> `shard_map` in between. The wrapper that really hides a name is
+> `custom_batching.custom_vmap`, which `op.py` puts around `fwd` — a tag
+> applied inside it is sealed into the `custom_vmap_call`'s jaxpr. Fixed in
+> 8cd20fd; the tag is now applied outside that wrapper.
 
 | | recompute cost |
 |---|---|

@@ -702,8 +702,14 @@ def _fused_gate_intra_kernel(
   # Load all MB heads at once
   q = q_ref[:, 0, 0]        # [MB, BT, K]
   k = k_ref[:, 0, 0]        # [MB, BT, K]
-  g = g_ref[:, 0, 0]        # [MB, BT, K]
-  beta = beta_ref[:, 0, 0]  # [MB, BT, 1]
+  # A scalar gate and beta are both stored `[.., 1, BT]` rather than
+  # `[.., BT, 1]`, to keep their size-1 axis off the minor dimension in HBM.
+  # Undo that here; everything below expects `[MB, BT, width]`.
+  if g_ref.shape[-2] == 1:
+    g = g_ref[:, 0, 0, 0][..., None]  # [MB, BT] -> [MB, BT, 1]
+  else:
+    g = g_ref[:, 0, 0]      # [MB, BT, K]
+  beta = beta_ref[:, 0, 0, 0][..., None]  # [MB, BT] -> [MB, BT, 1]
   v = v_ref[:, 0, 0]        # [MB, BT, V]
 
   # --- Gate activation + cumsum ---
@@ -937,8 +943,25 @@ def pallas_kda_fwd_intra_fused(
   q_r = q.reshape(H, B, NC, BT, K)
   k_r = k.reshape(H, B, NC, BT, K)
   GW = g.shape[-1]   # K for a per-channel gate, 1 for a scalar one
-  g_r = g.reshape(H, B, NC, BT, GW)
-  beta_r = beta.reshape(H, B, NC, BT, 1)
+  scalar_gate = GW == 1
+  # [.., 1, BT], not [.., BT, 1]. TPU tiles the last two dimensions [8, 128],
+  # so a size-1 minor axis is padded out to 128 lanes and 127 of every 128
+  # entries hold nothing. Putting the 1 on the sublane axis instead pads it to
+  # 8 while BT pads 64 -> 128: 16x rather than 128x.
+  #
+  # The backward already does this (see `_fused_dhu_wy_intra_cumsum_pallas_jit`);
+  # the forward was left behind, and XProf charges the leftover relayouts
+  # 302.26 ms in the forward plus 307.15 ms in the remat at 397B.
+  #
+  # beta is the clear case: it arrives `[H, B, T]` with T on the lanes, so the
+  # old `reshape(..., BT, 1)` *created* the padded axis. It is one number per
+  # token in both gate modes, so Kimi Delta Attention was paying for it too.
+  #
+  # Dropping the axis altogether would be better still, but Mosaic requires a
+  # block's second-minor dimension to equal the array's or be a multiple of 8,
+  # and the grid walks one chunk at a time. See commit f603701.
+  g_r = g.reshape(H, B, NC, 1, BT) if scalar_gate else g.reshape(H, B, NC, BT, GW)
+  beta_r = beta.reshape(H, B, NC, 1, BT)
   v_r = v.reshape(H, B, NC, BT, V)
 
   if use_gate_in_kernel:
@@ -964,6 +987,13 @@ def pallas_kda_fwd_intra_fused(
     return pl.BlockSpec(
       index_map=lambda i, j, l: (i, 0, 0, 0, 0),
       block_shape=(MB, 1, 1, 1, last_dim),
+    )
+
+  def _make_narrow_spec():
+    """For an operand stored `[.., 1, BT]` to keep its size-1 axis off lanes."""
+    return pl.BlockSpec(
+      index_map=lambda i, j, l: (i, j, l, 0, 0),
+      block_shape=(MB, 1, 1, 1, BT),
     )
 
   (u_r, w_r, qg_r, kg_r, Aqk_r, Akk_inv_r, g_cumsum_r) = pl.pallas_call(
@@ -995,8 +1025,8 @@ def pallas_kda_fwd_intra_fused(
     in_specs=[
       _make_spec(K),
       _make_spec(K),
-      _make_spec(GW),
-      _make_spec(1),
+      _make_narrow_spec() if scalar_gate else _make_spec(GW),
+      _make_narrow_spec(),
       _make_spec(V),
       _make_per_head_spec(1),
       _make_per_head_spec(K),

@@ -52,12 +52,31 @@ non-kernel JAX ops       A  1,795.31       B  3,303.48       +1,508.17
 
 | | cost to us |
 |---|---|
-| causal conv1d as a standalone op, across forward, remat and backward | ~1,545 ms |
+| causal conv1d as a standalone op, across forward, remat and backward | ~1,545 ms — **RETRACTED, see below** |
 | width-1 gate relayouts, `[B,H,T] -> [B,H,T,1]` | ~609 ms |
 | pure-JAX Q/K L2-norm and head transposes, run twice | ~320 ms |
 
 The baseline fuses conv1d into its forward kernel and pays almost nothing for
 it in the forward.
+
+> **Retraction, 14 September. The 1,545 ms is wrong.** It was read off the
+> `convolution fusion` category, and XLA:TPU files `DenseGeneral`'s
+> `dot_general` (`linears.py:110`) under that same category. Most of that
+> number is matrix multiplication, not convolution.
+>
+> Itemised op by op against `linear.py:889` and `qwen3.py:1100-1103` in
+> xid/289317276, the standalone conv1d costs **885.72 ms per step** across all
+> 45 layers: 97.68 ms forward, 112.53 ms remat, 674.70 ms backward VJP.
+>
+> **This kills conv1d fusion as a priority.** Only the forward and remat parts,
+> 181 ms of compute, are what the baseline fuses away; it runs its own
+> convolution in pure JAX in its VJP and pays the backward cost too. 181 ms is
+> not worth a kernel change.
+>
+> One caveat on the retraction itself: an earlier pass over the *same* trace
+> reported 131.18 ms, differing almost entirely in the backward VJP line
+> (52.10 ms against 508.38 ms). The 886 ms figure is the itemised one and is
+> the more credible, but the two have not been reconciled.
 
 ## The result that changed the plan
 
@@ -92,6 +111,15 @@ Recorded because both changed a decision.
 **Conv1d.** I estimated 15 ms and argued against fusing it on that basis. It
 costs ~1,545 ms. The 15 ms figure was the HBM traffic that fusion saves, not
 the cost of running the op.
+
+> **And then that was wrong too.** 14 September: the 1,545 ms counted
+> `DenseGeneral` matmuls that XLA files under `convolution fusion`. The real
+> figure is 885.72 ms, of which only 181 ms is the forward-and-remat part a
+> fused kernel would remove. So the original instinct — do not fuse conv1d —
+> was right, reached through a wrong number, overturned by a wronger one, and
+> is now right again on an itemised measurement. Three readings of one
+> quantity, each of which changed a decision. Itemise before believing a
+> category total.
 
 **The recompute.** I reported 912 ms as gap, which credited us with a cost the
 baseline also pays. It is +153 ms as a difference and ~1,990 ms as an absolute

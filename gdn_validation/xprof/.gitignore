@@ -1,0 +1,3 @@
+# XProf dumps: large, and tied to two specific sessions. Re-export rather
+# than commit. See README.md.
+arm_*_hlo_stats_all.json

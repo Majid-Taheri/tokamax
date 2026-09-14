@@ -76,6 +76,13 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
   """
 
   supports_symbolic_shapes = False
+  # The forward is one fused Pallas kernel, so recomputing the residuals costs
+  # a second launch of it. Under MaxText's `remat_policy=full` at 397B that
+  # measured 912.53 ms per step, 60% of the gap to the MaxKernel baseline.
+  # Name them so a caller can save them instead. See
+  # `gdn_validation/probe_remat_custom_vjp.py` for why the name and
+  # `optimize_remat=False` are both needed, and neither is enough alone.
+  residuals_checkpoint_name = "kda_residuals"
 
   @jaxtyping.jaxtyped
   @override

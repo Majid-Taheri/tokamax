@@ -603,8 +603,6 @@ def _chunk_gated_delta_rule_fwd_kernel(
     if h0_ref is not None:
       scratch_ref[...] = h0_ref[0, 0].astype(jnp.float32)
 
-  # The block spec places this chunk's slice at index 0, so `idx_nt` selects
-  # the window rather than an offset inside it.
   h_ref[0, 0, 0] = scratch_ref[...].astype(h_ref.dtype)
 
   b_w = w_ref[0, 0]
@@ -792,12 +790,7 @@ def _chunk_gated_delta_rule_fwd(
     else None
   )
 
-  # One chunk per grid step, like every other spec here. Taking the whole NT
-  # dimension put the entire [NT, K, V] output in VMEM -- 32 MiB at T=65536
-  # with chunk 64, and 64 MiB once double-buffered, which is the whole of
-  # Ghostfish's VMEM before any input window is allocated. The kernel only
-  # ever writes this chunk's slice and never reads the array back, so there
-  # is nothing to keep resident.
+  # Slice one chunk per grid step to avoid allocating the full [NT, K, V] output in VMEM.
   h_blockspec_out = pl.BlockSpec(
     [1, 1, 1, K_PADSIZE, V_ALIGNED], lambda b, h, nt: (h, b, nt, 0, 0)
   )

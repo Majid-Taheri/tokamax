@@ -92,14 +92,8 @@ def kimi_delta_attention(
       Its segment dimension `N` determines `max_num_segments` when the latter
       is omitted.
     output_final_state: Whether to return the final recurrent state.
-    per_channel_gate: Whether the gate carries an independent value per key
-      channel (True, the Kimi Delta Attention case) or one scalar per head and
-      token broadcast across channels (False, the Gated Delta Net case). With a
-      scalar gate the decay factors out of the key contraction, so the kernel
-      applies it as a [chunk, chunk] matrix after an ungated matmul instead of
-      folding it into the operands. That is cheaper, and it avoids the overflow
-      the per-channel path can hit: the factored form splits an exponent that is
-      always <= 0 into two halves that can separately reach inf and 0.
+    per_channel_gate: Whether `gate` has an independent value per key channel
+      (True, shape `[..., K]`) or a scalar per head/token (False, shape `[..., 1]`).
     use_qk_l2norm: Whether to normalize query/key on the last dimension before
       running KDA.
     use_gate_in_kernel: Whether `gate` is raw input that should be activated

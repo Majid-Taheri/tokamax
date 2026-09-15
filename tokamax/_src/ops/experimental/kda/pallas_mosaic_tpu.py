@@ -91,11 +91,7 @@ class _PreparedKdaInputs:
 
 
 def _requested_chunk_size(ba) -> int:
-  """The caller's chunk_size, or 64 when it did not ask for one.
-
-  A per-channel gate is forced back to 64: that is the only size Kimi Delta
-  Attention has been validated at, and this change is not meant to alter it.
-  """
+  """Returns the requested chunk_size, defaulting to 64 (mandatory for per-channel gates)."""
   args = getattr(ba, "arguments", None) or {}
   requested = args.get("chunk_size")
   if requested is None or args.get("per_channel_gate", True):
@@ -174,12 +170,7 @@ def check_inputs_support(
           "recurrent state per batch item; got "
           f"N={initial_state.shape[1]}."
       )
-  # Kimi Delta Attention ships validated at 64 only. The Gated Delta Net path
-  # takes any power of two: nothing in the kernel is 64-specific -- BC=16 gives
-  # NC = chunk_size/16 sub-blocks, and the Neumann inverse's doubling table
-  # already covers num_blocks up to 32, i.e. chunk_size up to 512. The cost is
-  # VMEM: the intra-chunk Aqk/Akk matrices are [chunk_size, chunk_size], so 128
-  # asks four times as much as 64.
+  # Per-channel gates require chunk_size=64; scalar gates support powers of 2 in [16, 512].
   if per_channel_gate:
     if chunk_size != 64:
       raise NotImplementedError(

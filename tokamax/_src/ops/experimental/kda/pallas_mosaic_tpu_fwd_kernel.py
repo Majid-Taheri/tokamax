@@ -587,44 +587,14 @@ def _solve_unit_lower_triangular_neumann_batched(A, b):
 # =============================================================================
 
 def _scalar_gate_intra(q_f32, k_f32, g_cumsum, beta_f32, *, BT: int, scale: float):
-  """Intra-chunk Aqk and L for a per-head scalar gate (Gated Delta Net).
-
-  The per-channel path has to fold the gate into the k contraction, which
-  forces it to split `exp2(g[r] - g[t])` into two factors around a reference
-  row. That split is where the kernel loses numerical range: each factor can
-  reach 2^+-inf on its own even though their product is always <= 1.
-
-  With a scalar gate the decay does not depend on the key channel, so it comes
-  out of the sum entirely:
-
-      Aqk[m,r,t] = exp2(g[m,r] - g[m,t]) * sum_k q[m,r,k] * k[m,t,k]
-
-  The exponent is now a single difference, masked to the causal half where it
-  is guaranteed <= 0, so exp2 lands in (0, 1] and cannot overflow. Under the
-  mask the two forms are algebraically identical -- this is a regrouping, not
-  an approximation.
-
-  Args:
-    q_f32: [MB, BT, K] queries.
-    k_f32: [MB, BT, K] keys.
-    g_cumsum: [MB, BT, K] chunk-local cumulative gate in log2 space. Every
-      channel holds the same value; channel 0 is read.
-    beta_f32: [MB, BT, 1] delta-rule write strength.
-    BT: chunk size.
-    scale: query scale, applied to Aqk only.
-
-  Returns:
-    `(Aqk, L)`, both [MB, BT, BT], causal- and strict-lower-masked to match
-    the per-channel path exactly.
-  """
+  """Computes intra-chunk Aqk and L for a scalar gate (Gated Delta Net)."""
   gs = g_cumsum[:, :, 0]                                       # [MB, BT]
   row = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
   col = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
   causal = row >= col
   strict = row > col
 
-  # Masked before exp2, so the anti-causal half never produces a positive
-  # exponent. Those entries are discarded by the mask below anyway.
+  # Mask pairwise differences before exp2 to prevent overflow on anti-causal entries.
   diff = gs[:, :, None] - gs[:, None, :]                       # [MB, BT, BT]
   decay = jnp.exp2(jnp.where(causal[None], diff, jnp.float32(0.0)))
 
@@ -639,7 +609,6 @@ def _scalar_gate_intra(q_f32, k_f32, g_cumsum, beta_f32, *, BT: int, scale: floa
 
   zero = jnp.float32(0.0)
   Aqk = jnp.where(causal[None], qk * decay * scale, zero)
-  # beta indexes the row, matching `Akk_row = qk_dot[:, BC:] * beta_i`.
   L = jnp.where(strict[None], kk * decay * beta_f32, zero)
   return Aqk, L
 
@@ -702,9 +671,7 @@ def _fused_gate_intra_kernel(
   # Load all MB heads at once
   q = q_ref[:, 0, 0]        # [MB, BT, K]
   k = k_ref[:, 0, 0]        # [MB, BT, K]
-  # A scalar gate and beta are both stored `[.., 1, BT]` rather than
-  # `[.., BT, 1]`, to keep their size-1 axis off the minor dimension in HBM.
-  # Undo that here; everything below expects `[MB, BT, width]`.
+  # Transpose width-1 inputs stored as [.., 1, BT] back to [MB, BT, 1].
   if g_ref.shape[-2] == 1:
     g = g_ref[:, 0, 0, 0][..., None]  # [MB, BT] -> [MB, BT, 1]
   else:
@@ -716,8 +683,6 @@ def _fused_gate_intra_kernel(
   g_f32 = g.astype(jnp.float32)
 
   if use_gate_in_kernel:
-    # Only reachable with a per-channel gate: delta_time_bias is per key
-    # channel, so it cannot be applied to a width-1 gate.
     assert per_channel_gate, "use_gate_in_kernel requires per_channel_gate=True"
     dt_b = delta_time_bias_ref[:, 0, 0, 0]        # [MB, K]
     g_f32 = g_f32 + dt_b[:, None, :]       # [MB, BT, K]
@@ -757,19 +722,6 @@ def _fused_gate_intra_kernel(
   #
   # Use broadcasted_iota for 2D indices to avoid Mosaic-unsupported i1
   # shape casts (e.g. (BT,) -> (BT, 1) on bool tensors).
-  #
-  # A scalar gate (`per_channel_gate=False`, i.e. Gated Delta Net) does not
-  # need any of this. When every key channel carries the same decay, the gate
-  # is independent of k and factors straight out of the contraction:
-  #
-  #   Aqk[m,r,t] = exp2(g[m,r] - g[m,t]) * sum_k q[m,r,k] * k[m,t,k]
-  #
-  # so the matmul runs ungated and a [BT, BT] decay matrix is applied after.
-  # That is both cheaper -- no exp over [BT, K], no gated copies of q and k --
-  # and numerically safe: the exponent is formed as a single difference that
-  # is <= 0 everywhere the causal mask keeps it, instead of being split into
-  # exp2(g[r] - ref) * exp2(ref - g[t]) whose two halves can independently
-  # overflow to inf and underflow to 0. See _scalar_gate_intra below.
   ref_idx = BC // 2 if safe_gate else 0
   row_iota_bt_k = jax.lax.broadcasted_iota(jnp.int32, (BT, K), dimension=0)
   row_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), dimension=0)
@@ -942,24 +894,9 @@ def pallas_kda_fwd_intra_fused(
   # [H, B, T, K] -> [H, B, NC, BT, K]
   q_r = q.reshape(H, B, NC, BT, K)
   k_r = k.reshape(H, B, NC, BT, K)
-  GW = g.shape[-1]   # K for a per-channel gate, 1 for a scalar one
+  GW = g.shape[-1]
   scalar_gate = GW == 1
-  # [.., 1, BT], not [.., BT, 1]. TPU tiles the last two dimensions [8, 128],
-  # so a size-1 minor axis is padded out to 128 lanes and 127 of every 128
-  # entries hold nothing. Putting the 1 on the sublane axis instead pads it to
-  # 8 while BT pads 64 -> 128: 16x rather than 128x.
-  #
-  # The backward already does this (see `_fused_dhu_wy_intra_cumsum_pallas_jit`);
-  # the forward was left behind, and XProf charges the leftover relayouts
-  # 302.26 ms in the forward plus 307.15 ms in the remat at 397B.
-  #
-  # beta is the clear case: it arrives `[H, B, T]` with T on the lanes, so the
-  # old `reshape(..., BT, 1)` *created* the padded axis. It is one number per
-  # token in both gate modes, so Kimi Delta Attention was paying for it too.
-  #
-  # Dropping the axis altogether would be better still, but Mosaic requires a
-  # block's second-minor dimension to equal the array's or be a multiple of 8,
-  # and the grid walks one chunk at a time. See commit f603701.
+  # Store width-1 axes as [.., 1, BT] to avoid 128-lane minor-axis padding in HBM.
   g_r = g.reshape(H, B, NC, 1, BT) if scalar_gate else g.reshape(H, B, NC, BT, GW)
   beta_r = beta.reshape(H, B, NC, 1, BT)
   v_r = v.reshape(H, B, NC, BT, V)

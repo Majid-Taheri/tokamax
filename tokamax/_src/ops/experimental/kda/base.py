@@ -29,6 +29,7 @@ from tokamax._src.ops.experimental.kda.cp_utils import (
 )
 from typing_extensions import override
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
@@ -48,8 +49,8 @@ def _validate_beta(beta: jax.Array) -> None:
 def _validate_gate_args(
     *,
     use_gate_in_kernel: bool,
-    a_log: jax.Array | None,
-    delta_time_bias: jax.Array | None,
+    a_log: jax.Array | AbstractArray | None,
+    delta_time_bias: jax.Array | AbstractArray | None,
     heads: int,
     key_dim: int,
     lower_bound: float | None,
@@ -76,34 +77,30 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
   """
 
   supports_symbolic_shapes = False
-  # The forward is one fused Pallas kernel, so recomputing the residuals costs
-  # a second launch of it. Under MaxText's `remat_policy=full` at 397B that
-  # measured 912.53 ms per step, 60% of the gap to the MaxKernel baseline.
-  # Name them so a caller can save them instead. See
-  # `gdn_validation/probe_remat_custom_vjp.py` for why the name and
-  # `optimize_remat=False` are both needed, and neither is enough alone.
   residuals_checkpoint_name = "kda_residuals"
 
   @jaxtyping.jaxtyped
   @override
   def bind(
       self,
-      query: Float[Array, "H B T K"],
-      key: Float[Array, "H B T K"],
-      value: Float[Array, "H B T V"],
-      gate: Float[Array, "H B T GW"],
-      beta: Float[Array, "H B T"],
+      query: Float[Array | AbstractArray, "H B T K"],
+      key: Float[Array | AbstractArray, "H B T K"],
+      value: Float[Array | AbstractArray, "H B T V"],
+      gate: Float[Array | AbstractArray, "H B T GW"],
+      beta: Float[Array | AbstractArray, "H B T"],
       *,
-      a_log: Float[Array, "H"] | None = None,
-      delta_time_bias: Float[Array, "H*K"] | None = None,
+      a_log: Float[Array | AbstractArray, "H"] | None = None,
+      delta_time_bias: Float[Array | AbstractArray, "H*K"] | None = None,
       scale: float | None = None,
-      initial_state: Float[Array, "B N H K V"] | None = None,
+      initial_state: (
+          Float[Array | AbstractArray, "B N H K V"] | None
+      ) = None,
       output_final_state: bool = False,
       use_qk_l2norm: bool = False,
       use_gate_in_kernel: bool = False,
       per_channel_gate: bool = True,
       chunk_size: int | None = None,
-      segment_ids: Int[Array, "B T"] | None = None,
+      segment_ids: Int[Array | AbstractArray, "B T"] | None = None,
       lower_bound: float | None = None,
       context_parallel_metadata: ContextParallelMetadata | None = None,
       max_num_segments: int | None = None,
@@ -157,9 +154,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
           "`use_gate_in_kernel=True` needs a per-channel gate:"
           " `delta_time_bias` is per key channel."
       )
-    # Validate the chunk size here, where the caller's actual request is still
-    # visible. Downstream the config coerces a per-channel gate back to 64, so
-    # a guard placed any later would silently accept a request it ignored.
     if chunk_size is not None:
       if chunk_size not in (16, 32, 64, 128, 256, 512):
         raise NotImplementedError(
@@ -234,10 +228,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       config: _Config,
   ) -> tuple[Output, Residuals]:
     """Dispatches to the pure JAX KDA reference implementation."""
-    del config, return_residuals
-    # The reference contracts the gate directly and never factors it, so
-    # both groupings are the same computation here.
-    del per_channel_gate, chunk_size   # reference chunks internally
+    del config, return_residuals, per_channel_gate, chunk_size
     _validate_beta(beta)
     output = reference.kimi_delta_attention(
         query,

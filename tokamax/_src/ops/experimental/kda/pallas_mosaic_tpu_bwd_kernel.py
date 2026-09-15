@@ -519,10 +519,7 @@ def _recompute_w_u_fwd(q, k, v, beta, A, gk, chunk_size):
   k_chunks = k.reshape(H * B * NT, BT, K)
   v_chunks = v.reshape(H * B * NT, BT, V)
   beta_chunks = beta.reshape(H * B * NT, BT, 1)
-  # The gate carries its own width: K per channel, 1 for a scalar gate. Keep
-  # it at that width and let the products below broadcast. Widening it to K
-  # would work too, but this is the path that exists to save memory, so
-  # materialising a 128x copy of the gate would defeat the point.
+  # Preserve gate width (K for per-channel, 1 for scalar) and broadcast in products below.
   g_chunks = gk.reshape(H * B * NT, BT, gk.shape[-1])
   g_exp = jnp.exp2(g_chunks)
   precision = (
@@ -842,9 +839,7 @@ def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
 
   dAkk_diag_beta = None
   if per_channel_gate:
-    # Re-centre on the block max so both halves stay representable. `col_d`
-    # still carries a positive exponent and overflows once the gate falls by
-    # more than ~128 in log2 across the BC rows of a block.
+    # Re-center around block max to prevent exp2 overflow across rows.
     g_max = jnp.max(g_b, axis=2, keepdims=True)
     row_d = jnp.exp2(g_b - g_max)
     col_d = jnp.exp2(g_max - g_b)
@@ -852,11 +847,7 @@ def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
     q_hat = q_b * row_d
     k_hat = k_b * beta_b * row_d
   else:
-    # Scalar gate: row_d[r] * col_d[t] is exactly exp2(g[r] - g[t]), so form
-    # that difference once as a [BC, BC] matrix and fold it into the
-    # cotangents before contracting. Nothing is re-centred and nothing can
-    # overflow -- the exponent is <= 0 wherever the causal mask keeps it.
-    # Same regrouping as the forward's _scalar_gate_intra.
+    # Scalar gate: fold causal pairwise decay exp2(g[r] - g[t]) directly into cotangents.
     row_d = col_d = None
     gs_b = g_b[:, :, :, 0]                                  # [NC, MB, BC]
     _r = jax.lax.broadcasted_iota(jnp.int32, (BC, BC), dimension=0)
@@ -866,8 +857,6 @@ def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
     _decay = jnp.where(_causal, jnp.exp2(jnp.where(_causal, _diff, 0.0)), 0.0)
     dAqk_diag = dAqk_diag * _decay
     dAkk_diag = dAkk_diag * _decay
-    # beta indexes the contracted row in the dk_col term, matching
-    # `k_hat = k_b * beta_b * row_d` on the per-channel side.
     dAkk_diag_beta = dAkk_diag * beta_b
     k_til, q_hat, k_hat = k_b, q_b, k_b
 
@@ -1052,15 +1041,11 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bqg = qg_ref[:, 0, 0].astype(jnp.float32)
   bkg = kg_ref[:, 0, 0]
   bw = w_ref[:, 0, 0].astype(jnp.float32)
-  # A scalar gate is stored transposed, [.., 1, BT] rather than [.., BT, 1],
-  # to keep the size-1 axis off the minor dimension in HBM. Undo that here;
-  # everything below expects [MB, BT, GW].
+  # Transpose scalar gate from [.., 1, BT] back to [MB, BT, 1] and broadcast to K in VMEM.
   if g_ref.shape[-2] == 1:
     bg = g_ref[:, 0, 0, 0].astype(jnp.float32)[..., None]
   else:
     bg = g_ref[:, 0, 0].astype(jnp.float32)
-  # A scalar gate arrives one value wide to keep it out of HBM. Widen it
-  # here, inside VMEM, so the rest of the backward is unchanged.
   _gate_narrow = bg.shape[-1] != K
   if _gate_narrow:
     bg = jnp.broadcast_to(bg, bg.shape[:-1] + (K,))
@@ -1102,8 +1087,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   dk_ref[:, 0, 0] = dk_total.astype(dk_ref.dtype)
   dv_ref[:, 0, 0] = (b_dvb * bb[:, :, None]).astype(dv_ref.dtype)
   db_ref[:, 0, 0, 0] = db_total.astype(db_ref.dtype)
-  # d(loss)/d(scalar gate) is the sum of the per-channel cotangents, since
-  # the one value feeds every channel.
+  # Sum per-channel gate gradients when using a scalar gate.
   if _gate_narrow:
     dg_reverse_cumsum = jnp.sum(dg_reverse_cumsum, axis=-1, keepdims=True)
   if dg_ref.shape[-2] == 1:
@@ -1203,11 +1187,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     per_head = io_per_head + io_per_head * 3 // 2
     hw = get_tpu_limits()
     vmem_budget = hw.vmem_limit_bytes
-    # The estimate above under-counts: at chunk 128 and real shapes the
-    # allocation still overflows VMEM even though io_per_head has grown 4x in
-    # its BT*BT terms. Scale the budget down with the chunk size rather than
-    # guessing at the missing term -- measured: 64 fits, 128 did not.
-    # KDA_BWD_VMEM_FRACTION lets this be tuned without a rebuild.
+    # Scale down VMEM budget for chunk sizes > 64 (override via KDA_BWD_VMEM_FRACTION).
     import os as _os  # pylint: disable=g-import-not-at-top
     _frac = float(_os.environ.get("KDA_BWD_VMEM_FRACTION", "0") or 0)
     if _frac > 0:
@@ -1231,25 +1211,11 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   qg_r = qg.reshape(H, B, NT, BT, K)
   kg_r = kg.reshape(H, B, NT, BT, K)
   w_r = w.reshape(H, B, NT, BT, K)
-  GW = g.shape[-1]   # K for a per-channel gate, 1 for a scalar one
-  # Same reason as beta below: a minor axis of size 1 pads to 128 lanes.
-  # A per-channel gate is already 128 wide and stays as it is.
+  GW = g.shape[-1]
   scalar_gate = GW == 1
+  # Store width-1 axes as [.., 1, BT] to avoid 128-lane minor-axis padding in HBM.
   g_r = (g.reshape(H, B, NT, 1, BT) if scalar_gate
          else g.reshape(H, B, NT, BT, GW))
-  # [.., 1, BT], not [.., BT, 1]. TPU tiles the last two dimensions [8, 128],
-  # so a size-1 minor axis pads out to 128 lanes and 127 of every 128 entries
-  # hold nothing: 16 MiB of beta becomes 2 GiB of buffer. Putting the 1 on the
-  # sublane axis instead pads it to 8 while BT pads 64 -> 128, so 16x rather
-  # than 128x -- 2 GiB down to 256 MiB.
-  #
-  # Dropping the axis altogether would be better still (2x), but Mosaic
-  # requires the block's second-minor dimension to equal the array's or be a
-  # multiple of 8. The grid walks one chunk at a time, so that dimension would
-  # be 1 against NT, and lowering rejects it.
-  #
-  # beta is one number per token in both gate modes, so this is not specific
-  # to the scalar path.
   beta_r = beta.reshape(H, B, NT, 1, BT)
   A_r = A.reshape(H, B, NT, BT, BT)
   h_r = h  # already [H, B, NT, K, V]
@@ -1489,12 +1455,7 @@ def chunk_kda_bwd_dAv_kernel(
     in_bytes = (2 * BT * V + BT * BT) * elem_size
     out_bytes = (BT * BT * 4 + BT * V * 2)
     per_chunk = in_bytes + out_bytes
-    # Mosaic packs the batch dimension of a `dot_general` into the tile, so the
-    # operand ends up MB*BT wide. The MXU is 128 wide, so anything past that is
-    # rejected outright -- MB=2 at BT=128 gives "Bad rhs type: 256, 256". VMEM
-    # alone does not catch this: a chip with more VMEM picks a *larger* MB and
-    # fails where a smaller one passed. Pin MB to 1 once BT is over 128/2.
-    # Kimi Delta Attention is fixed at BT=64 and keeps the old bound.
+    # Pin MB=1 when BT > 64 so MB * BT stays within the 128-wide MXU limit.
     max_mb = 1 if BT > 64 else 32
     MB = estimate_mini_batch(per_chunk, total, max_mb=max_mb)
   else:
@@ -1747,8 +1708,7 @@ def chunk_kda_bwd_custom(
       raise ValueError(f"saved h has NT={h.shape[2]}, expected {NT}")
 
     # M1 fusion: recompute w/qg/kg + v_new in one kernel (no u HBM round-trip).
-    # This helper indexes the gate per key channel, so widen a scalar gate for
-    # it. Only the recompute path pays that; the main backward keeps it narrow.
+    # Broadcast scalar gate to key width K for the recompute helper.
     assert g is not None
     g_wide = (
       g if g.shape[-1] == q.shape[-1]
@@ -1793,17 +1753,7 @@ def chunk_kda_bwd_custom(
     if kg is None:
       raise RuntimeError("KDA recompute did not produce gated keys.")
 
-    # chunk_gated_delta_rule_fwd_h expects [B,T,H,X]
-    # Two gate inputs, and a scalar gate belongs in the other one. `gk` decays
-    # each key channel by its own entry, so the kernel reads it K_PADSIZE wide
-    # -- a width-1 array is read past its end, and zero-padding it would be
-    # worse, since exp2(0) means "no decay" on every padded channel. `g` is the
-    # scalar form: the kernel reads column 0 and scales the whole state by it.
-    #
-    # They also place the per-token factor differently. `gk` expects the caller
-    # to have folded exp2(g_last - g) into the keys; `g` applies it to the
-    # values inside the kernel. Same product either way, since the factor is
-    # one number per token, so pass the plain keys on that path.
+    # Pass scalar gates via `g` with plain keys `k`; pass per-channel gates via `gk` with gated keys `kg`.
     assert g is not None
     scalar_gate = g.shape[-1] == 1
     h, v_new, _ = chunk_gated_delta_rule_fwd_h(

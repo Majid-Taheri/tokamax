@@ -255,6 +255,7 @@ def run_config(
   print(f"  Dtype                : bfloat16 inputs/outputs, float32 state/accumulators")
   print(f"  mini_batch setting   : {mini_batch} (effective MB={'16 (auto)' if mini_batch is None else mini_batch})")
   eff_mb = 16 if mini_batch is None else mini_batch
+  print(f"  Heads per group (MB) : {eff_mb} (N_HG = H // MB = {H // eff_mb} head groups, feeds dot_general batch dim)")
   print(f"  Pallas Grid          : (H // MB, B, NT) = ({H // eff_mb}, {B}, {NT})")
   print(f"  Dimension semantics  : ('parallel', 'parallel', 'arbitrary')")
   print("=" * 80)

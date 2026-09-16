@@ -1535,6 +1535,53 @@ def chunk_kda_bwd_dAv_kernel(
 # chunk_kda_bwd_custom  —  backward adapter and 6-stage orchestrator
 # =====================================================================
 
+def _conv1d_silu_bwd(
+    x_raw: jax.Array,
+    w: jax.Array,
+    bias: jax.Array | None,
+    dout: jax.Array,
+    aligned_segment_ids: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+  """Computes VJP of depthwise causal conv1d + SiLU, supporting GQA head repeats."""
+  H, B, T, D = x_raw.shape
+  H_w, W, _ = w.shape
+  repeats = H // H_w
+
+  def _fwd_fn(x_in, w_in, b_in):
+    x_f32 = x_in.astype(jnp.float32)
+    w_f32 = w_in.astype(jnp.float32)
+    acc = x_f32 * w_f32[:, None, W - 1 : W, :]
+    for lag in range(1, W):
+      x_lag = jnp.pad(x_f32[:, :, :-lag, :], ((0, 0), (0, 0), (lag, 0), (0, 0)))
+      if aligned_segment_ids is not None:
+        same_seg = (
+            aligned_segment_ids[:, lag:] == aligned_segment_ids[:, :-lag]
+        ) & (aligned_segment_ids[:, lag:] >= 0)
+        same_seg = jnp.pad(same_seg, ((0, 0), (lag, 0)))
+        x_lag = jnp.where(same_seg[None, :, :, None], x_lag, 0.0)
+      acc = acc + x_lag * w_f32[:, None, W - 1 - lag : W - lag, :]
+    if b_in is not None:
+      acc = acc + b_in.astype(jnp.float32)[:, None, None, :]
+    return jax.nn.silu(acc).astype(x_in.dtype)
+
+  if repeats > 1:
+    x_raw_k = x_raw[::repeats]
+    dout_k = jnp.sum(dout.astype(x_raw.dtype).reshape(H_w, repeats, B, T, D), axis=1)
+    _, vjp_fn = jax.vjp(_fwd_fn, x_raw_k, w, bias)
+    dx_raw_k, dw, db = vjp_fn(dout_k)
+    dx_raw = jnp.zeros_like(x_raw).at[::repeats].set(dx_raw_k.astype(x_raw.dtype))
+  else:
+    _, vjp_fn = jax.vjp(_fwd_fn, x_raw, w, bias)
+    dx_raw, dw, db = vjp_fn(dout.astype(x_raw.dtype))
+    dx_raw = dx_raw.astype(x_raw.dtype)
+
+  return (
+      dx_raw,
+      dw.astype(w.dtype),
+      (db.astype(bias.dtype) if bias is not None and db is not None else None),
+  )
+
+
 @functools.partial(
   jax.jit,
   static_argnames=[
@@ -1578,6 +1625,12 @@ def chunk_kda_bwd_custom(
     Float[Array, "H*K"] | None,
     Float[Array, "B N H K V"] | None,
     None,
+    Float[Array, "H_Q W K"] | None,
+    Float[Array, "H_K W K"] | None,
+    Float[Array, "H W V"] | None,
+    Float[Array, "H_Q K"] | None,
+    Float[Array, "H_K K"] | None,
+    Float[Array, "H V"] | None,
 ]:
   """Runs the full KDA backward pipeline from forward residuals."""
   do, dht = grad_outputs
@@ -1949,6 +2002,37 @@ def chunk_kda_bwd_custom(
     dq = l2norm_bwd(q, rstd_q, dq)
     dk = l2norm_bwd(k, rstd_k, dk)
 
+  dw_q = dw_k = dw_v = None
+  db_q = db_k = db_v = None
+  if residuals.q_raw is not None:
+    assert residuals.k_raw is not None and residuals.v_raw is not None
+    assert (
+        residuals.conv_weight_q is not None
+        and residuals.conv_weight_k is not None
+        and residuals.conv_weight_v is not None
+    )
+    dq, dw_q, db_q = _conv1d_silu_bwd(
+        residuals.q_raw,
+        residuals.conv_weight_q,
+        residuals.conv_bias_q,
+        dq,
+        segment_ids_aligned,
+    )
+    dk, dw_k, db_k = _conv1d_silu_bwd(
+        residuals.k_raw,
+        residuals.conv_weight_k,
+        residuals.conv_bias_k,
+        dk,
+        segment_ids_aligned,
+    )
+    dv, dw_v, db_v = _conv1d_silu_bwd(
+        residuals.v_raw,
+        residuals.conv_weight_v,
+        residuals.conv_bias_v,
+        dv,
+        segment_ids_aligned,
+    )
+
   if cu_seqlens is not None:
     dq = _unalign_output(dq, cu_seqlens, aligned_cu, T_orig)
     dk = _unalign_output(dk, cu_seqlens, aligned_cu, T_orig)
@@ -1969,4 +2053,10 @@ def chunk_kda_bwd_custom(
       dbias,
       dh0,
       None,
+      dw_q,
+      dw_k,
+      dw_v,
+      db_q,
+      db_k,
+      db_v,
   )

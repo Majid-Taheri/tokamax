@@ -145,6 +145,13 @@ def kda_chunk_gated_delta_rule(
     use_qk_norm_in_gdn: bool = False,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     implementation: str | None = None,
+    conv_weight_q: None | Array = None,
+    conv_weight_k: None | Array = None,
+    conv_weight_v: None | Array = None,
+    conv_bias_q: None | Array = None,
+    conv_bias_k: None | Array = None,
+    conv_bias_v: None | Array = None,
+    use_conv1d_in_kernel: bool = False,
 ) -> tuple[Array, None | Array]:
   """Gated Delta Rule via the KDA Pallas kernel.
 
@@ -224,6 +231,19 @@ def kda_chunk_gated_delta_rule(
   else:
     init = initial_state.astype(jnp.float32)[:, None]
 
+  conv_kwargs = {}
+  if use_conv1d_in_kernel:
+    assert conv_weight_q is not None and conv_weight_k is not None and conv_weight_v is not None
+    conv_kwargs = {
+        "conv_weight_q": conv_weight_q,
+        "conv_weight_k": conv_weight_k,
+        "conv_weight_v": conv_weight_v,
+        "conv_bias_q": conv_bias_q,
+        "conv_bias_k": conv_bias_k,
+        "conv_bias_v": conv_bias_v,
+        "use_conv1d_in_kernel": True,
+    }
+
   out, final_state = api.kimi_delta_attention(
       q,
       k,
@@ -237,6 +257,7 @@ def kda_chunk_gated_delta_rule(
       use_gate_in_kernel=False,
       use_qk_l2norm=use_qk_norm_in_gdn,
       **gate_kwargs,
+      **conv_kwargs,
       **({} if implementation is None else {"implementation": implementation}),
   )
 

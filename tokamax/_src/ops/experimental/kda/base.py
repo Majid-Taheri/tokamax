@@ -105,6 +105,13 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       context_parallel_metadata: ContextParallelMetadata | None = None,
       max_num_segments: int | None = None,
       return_residuals: bool = False,
+      conv_weight_q: Float[Array | AbstractArray, "H_Q W K"] | None = None,
+      conv_weight_k: Float[Array | AbstractArray, "H_K W K"] | None = None,
+      conv_weight_v: Float[Array | AbstractArray, "H W V"] | None = None,
+      conv_bias_q: Float[Array | AbstractArray, "H_Q K"] | None = None,
+      conv_bias_k: Float[Array | AbstractArray, "H_K K"] | None = None,
+      conv_bias_v: Float[Array | AbstractArray, "H V"] | None = None,
+      use_conv1d_in_kernel: bool = False,
   ) -> op.BoundArguments:
     """Binds KDA arguments and validates semantic constraints."""
     heads, _, _, key_dim = query.shape
@@ -199,6 +206,13 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         context_parallel_metadata=context_parallel_metadata,
         max_num_segments=max_num_segments,
         return_residuals=return_residuals,
+        conv_weight_q=conv_weight_q,
+        conv_weight_k=conv_weight_k,
+        conv_weight_v=conv_weight_v,
+        conv_bias_q=conv_bias_q,
+        conv_bias_k=conv_bias_k,
+        conv_bias_v=conv_bias_v,
+        use_conv1d_in_kernel=use_conv1d_in_kernel,
     )
 
   @jaxtyping.jaxtyped
@@ -225,6 +239,13 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
+      conv_weight_q: Float[Array, "H_Q W K"] | None = None,
+      conv_weight_k: Float[Array, "H_K W K"] | None = None,
+      conv_weight_v: Float[Array, "H W V"] | None = None,
+      conv_bias_q: Float[Array, "H_Q K"] | None = None,
+      conv_bias_k: Float[Array, "H_K K"] | None = None,
+      conv_bias_v: Float[Array, "H V"] | None = None,
+      use_conv1d_in_kernel: bool = False,
       config: _Config,
   ) -> tuple[Output, Residuals]:
     """Dispatches to the pure JAX KDA reference implementation."""
@@ -247,5 +268,12 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         lower_bound=lower_bound,
         context_parallel_metadata=context_parallel_metadata,
         max_num_segments=max_num_segments,
+        conv_weight_q=conv_weight_q,
+        conv_weight_k=conv_weight_k,
+        conv_weight_v=conv_weight_v,
+        conv_bias_q=conv_bias_q,
+        conv_bias_k=conv_bias_k,
+        conv_bias_v=conv_bias_v,
+        use_conv1d_in_kernel=use_conv1d_in_kernel,
     )
     return output, None

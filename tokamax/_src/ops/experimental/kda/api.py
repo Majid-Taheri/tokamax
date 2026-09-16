@@ -62,6 +62,13 @@ def kimi_delta_attention(
     lower_bound: float | None = None,
     context_parallel_metadata: ContextParallelMetadata | None = None,
     max_num_segments: int | None = None,
+    conv_weight_q: Float[Array, "H_Q W K"] | None = None,
+    conv_weight_k: Float[Array, "H_K W K"] | None = None,
+    conv_weight_v: Float[Array, "H W V"] | None = None,
+    conv_bias_q: Float[Array, "H_Q K"] | None = None,
+    conv_bias_k: Float[Array, "H_K K"] | None = None,
+    conv_bias_v: Float[Array, "H V"] | None = None,
+    use_conv1d_in_kernel: bool = False,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> tuple[Float[Array, "H B T V"], Float[Array, "B N H K V"] | None]:
   """Kimi Delta Attention.
@@ -153,6 +160,13 @@ def kimi_delta_attention(
           lower_bound=lower_bound,
           context_parallel_metadata=context_parallel_metadata,
           max_num_segments=max_num_segments,
+          conv_weight_q=conv_weight_q,
+          conv_weight_k=conv_weight_k,
+          conv_weight_v=conv_weight_v,
+          conv_bias_q=conv_bias_q,
+          conv_bias_k=conv_bias_k,
+          conv_bias_v=conv_bias_v,
+          use_conv1d_in_kernel=use_conv1d_in_kernel,
       )
     except NotImplementedError as e:
       if len(implementation) == 1:

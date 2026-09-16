@@ -235,6 +235,7 @@ class PallasMosaicTpuKimiDeltaAttention(
       context_parallel_metadata: ContextParallelMetadata | None,
       chunk_size: int,
       max_num_segments: int | None,
+      use_conv1d_in_kernel: bool = False,
   ) -> _PreparedKdaInputs:
     """Canonicalizes inputs shared by the forward and backward kernels."""
     context_parallel_metadata, cu_seqlens = derive_context_parallel_metadata(
@@ -343,7 +344,7 @@ class PallasMosaicTpuKimiDeltaAttention(
           ]
       )
 
-    if use_qk_l2norm:
+    if use_qk_l2norm and not use_conv1d_in_kernel:
       q_prepared, q_rstd = l2norm_fwd(q_aligned)
       k_prepared, k_rstd = l2norm_fwd(k_aligned)
     else:
@@ -390,6 +391,13 @@ class PallasMosaicTpuKimiDeltaAttention(
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
+      conv_weight_q: Float[Array, "H_Q W K"] | None = None,
+      conv_weight_k: Float[Array, "H_K W K"] | None = None,
+      conv_weight_v: Float[Array, "H W V"] | None = None,
+      conv_bias_q: Float[Array, "H_Q K"] | None = None,
+      conv_bias_k: Float[Array, "H_K K"] | None = None,
+      conv_bias_v: Float[Array, "H V"] | None = None,
+      use_conv1d_in_kernel: bool = False,
       config: Config,
   ) -> tuple[base.Output, base.Residuals]:
     chunk_size = config.chunk_size
@@ -428,6 +436,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         context_parallel_metadata=context_parallel_metadata,
         chunk_size=chunk_size,
         max_num_segments=max_num_segments,
+        use_conv1d_in_kernel=use_conv1d_in_kernel,
     )
 
     output, residuals = chunk_kda_fwd_custom(
@@ -456,6 +465,14 @@ class PallasMosaicTpuKimiDeltaAttention(
         aligned_segment_ids=prepared.aligned_segment_ids,
         q_rstd=prepared.q_rstd,
         k_rstd=prepared.k_rstd,
+        conv_weight_q=conv_weight_q,
+        conv_weight_k=conv_weight_k,
+        conv_weight_v=conv_weight_v,
+        conv_bias_q=conv_bias_q,
+        conv_bias_k=conv_bias_k,
+        conv_bias_v=conv_bias_v,
+        use_conv1d_in_kernel=use_conv1d_in_kernel,
+        use_qk_l2norm=use_qk_l2norm,
     )
     value, final_state = output
     if final_state is not None and final_state.ndim == 4:
@@ -505,12 +522,19 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
+      conv_weight_q: jax.Array | None = None,
+      conv_weight_k: jax.Array | None = None,
+      conv_weight_v: jax.Array | None = None,
+      conv_bias_q: jax.Array | None = None,
+      conv_bias_k: jax.Array | None = None,
+      conv_bias_v: jax.Array | None = None,
+      use_conv1d_in_kernel: bool = False,
       config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
     # Tokamax's VJP contract replays the original inputs here, but the backward
     # kernel consumes the aligned and optionally L2-normalized copies retained
     # in `residuals`. Reusing these arguments would skip that preprocessing.
-    del out, query, key, value, gate, beta, output_final_state, return_residuals
+    del out, query, key, value, gate, beta, output_final_state, return_residuals, use_conv1d_in_kernel
     chunk_size = config.chunk_size
     # The forward residual set records the selected policy: a retained hidden
     # state means backward can use the saved-state path; otherwise it must
@@ -527,6 +551,12 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         dbias,
         dh0,
         dsegment_ids,
+        dw_q,
+        dw_k,
+        dw_v,
+        db_q,
+        db_k,
+        db_v,
     ) = chunk_kda_bwd_custom(
         scale,
         use_qk_l2norm,
@@ -549,6 +579,18 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         "gate": dg,
         "beta": db,
     }
+    if conv_weight_q is not None:
+      grads["conv_weight_q"] = dw_q if dw_q is not None else jnp.zeros_like(conv_weight_q)
+    if conv_weight_k is not None:
+      grads["conv_weight_k"] = dw_k if dw_k is not None else jnp.zeros_like(conv_weight_k)
+    if conv_weight_v is not None:
+      grads["conv_weight_v"] = dw_v if dw_v is not None else jnp.zeros_like(conv_weight_v)
+    if conv_bias_q is not None:
+      grads["conv_bias_q"] = db_q if db_q is not None else jnp.zeros_like(conv_bias_q)
+    if conv_bias_k is not None:
+      grads["conv_bias_k"] = db_k if db_k is not None else jnp.zeros_like(conv_bias_k)
+    if conv_bias_v is not None:
+      grads["conv_bias_v"] = db_v if db_v is not None else jnp.zeros_like(conv_bias_v)
     if a_log is not None:
       grads["a_log"] = dA if dA is not None else jnp.zeros_like(a_log)
     if delta_time_bias is not None:

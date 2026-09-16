@@ -702,6 +702,9 @@ def _fused_gate_intra_kernel(
   V = value_dim
   MB = mini_batch
 
+  q_prev_ref = k_prev_ref = v_prev_ref = None
+  w_q_ref = w_k_ref = w_v_ref = None
+  b_q_ref = b_k_ref = b_v_ref = None
   if use_conv1d_in_kernel:
     (
       q_prev_ref,
@@ -733,6 +736,17 @@ def _fused_gate_intra_kernel(
   v_in = v_ref[:, 0, 0]        # [MB, BT, V]
 
   if use_conv1d_in_kernel:
+    assert (
+        q_prev_ref is not None
+        and k_prev_ref is not None
+        and v_prev_ref is not None
+        and w_q_ref is not None
+        and w_k_ref is not None
+        and w_v_ref is not None
+        and b_q_ref is not None
+        and b_k_ref is not None
+        and b_v_ref is not None
+    )
     q_prev = q_prev_ref[:, 0, 0]  # [MB, 8, K]
     k_prev = k_prev_ref[:, 0, 0]  # [MB, 8, K]
     v_prev = v_prev_ref[:, 0, 0]  # [MB, 8, V]
@@ -747,6 +761,7 @@ def _fused_gate_intra_kernel(
     k_silu = _apply_causal_conv1d_silu(k_in, k_prev, w_k, b_k, conv_kernel_size).astype(dtype)
     v_silu = _apply_causal_conv1d_silu(v_in, v_prev, w_v, b_v, conv_kernel_size).astype(dtype)
 
+    q_rstd_val = k_rstd_val = None
     if use_qk_l2norm:
       q_f32_s = q_silu.astype(jnp.float32)
       k_f32_s = k_silu.astype(jnp.float32)
@@ -767,6 +782,7 @@ def _fused_gate_intra_kernel(
       k_norm_ref[:, 0, 0] = k
       v_silu_ref[:, 0, 0] = v
       if use_qk_l2norm:
+        assert q_rstd_val is not None and k_rstd_val is not None
         q_rstd_ref = extra_out_refs[3]
         k_rstd_ref = extra_out_refs[4]
         q_rstd_ref[:, 0, 0, 0] = q_rstd_val[..., 0]
@@ -1958,6 +1974,7 @@ def chunk_kda_fwd_custom(
 
   # Keep the prepared inputs: the Op-level VJP also retains the original
   # arguments, but these copies may be varlen-aligned and L2-normalized.
+  assert q_res is not None and k_res is not None and v_res is not None
   residuals = KdaResiduals(
       q=q_res,
       k=k_res,

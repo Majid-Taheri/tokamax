@@ -78,6 +78,7 @@ import functools
 import logging
 
 import jax
+from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 from jax import Array
 
@@ -184,6 +185,14 @@ def kda_chunk_gated_delta_rule(
   batch, seq_len, num_v_heads, head_k_dim = query.shape
   head_v_dim = value.shape[-1]
 
+  # Tag inputs with PR 5098 GDN checkpoint names so remat policies ('device' or
+  # 'offload') can save/offload them without recomputing projections/conv1d.
+  query = checkpoint_name(query, "gdn_qkv")
+  key = checkpoint_name(key, "gdn_qkv")
+  value = checkpoint_name(value, "gdn_qkv")
+  beta = checkpoint_name(beta, "gdn_b")
+  g = checkpoint_name(g, "gdn_a")
+
   # [B, S, H, D] -> [H, B, S, D]. Tokamax's KDA is head-first throughout.
   to_head_first = lambda x: jnp.transpose(x, (2, 0, 1, 3))
   q = to_head_first(query.astype(compute_dtype))
@@ -232,5 +241,6 @@ def kda_chunk_gated_delta_rule(
   )
 
   core_attn_out = jnp.transpose(out, (1, 2, 0, 3))  # -> [B, S, H, V]
+  core_attn_out = checkpoint_name(core_attn_out.astype(query.dtype), "gdn_core_attn_out")
   next_state = None if final_state is None else final_state[:, 0]  # drop N=1
-  return core_attn_out.astype(query.dtype), next_state
+  return core_attn_out, next_state

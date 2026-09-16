@@ -1038,9 +1038,6 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bk = k_ref[:, 0, 0].astype(jnp.float32)
   bv = v_ref[:, 0, 0].astype(jnp.float32)
   bvn = v_new_ref[:, 0, 0].astype(jnp.float32)
-  bqg = qg_ref[:, 0, 0].astype(jnp.float32)
-  bkg = kg_ref[:, 0, 0]
-  bw = w_ref[:, 0, 0].astype(jnp.float32)
   # Transpose scalar gate from [.., 1, BT] back to [MB, BT, 1] and broadcast to K in VMEM.
   if g_ref.shape[-2] == 1:
     bg = g_ref[:, 0, 0, 0].astype(jnp.float32)[..., None]
@@ -1056,6 +1053,21 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bdo = do_ref[:, 0, 0]
   bdv0 = dv0_ref[:, 0, 0].astype(jnp.float32)
   bdAqk = dAqk_ref[:, 0, 0].astype(jnp.float32)
+
+  if qg_ref is not None and kg_ref is not None and w_ref is not None:
+    bqg = qg_ref[:, 0, 0].astype(jnp.float32)
+    bkg = kg_ref[:, 0, 0]
+    bw = w_ref[:, 0, 0].astype(jnp.float32)
+  else:
+    g_exp = jnp.exp2(bg)
+    bqg = (bq * g_exp).astype(q_ref.dtype).astype(jnp.float32)
+    bkg = (bk * jnp.exp2(bg[:, BT - 1:BT, :] - bg)).astype(k_ref.dtype)
+    bw = jnp.matmul(
+        bA,
+        (bk * bb[:, :, None] * g_exp).astype(jnp.float32),
+        precision=precision,
+        preferred_element_type=jnp.float32,
+    ).astype(k_ref.dtype).astype(jnp.float32)
 
   # --- dhu reverse recurrence ---
   bdv, dh_new = compute_dhu_recurrence(
@@ -1118,9 +1130,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   k: Float[Array, "H B T K"],
   v: Float[Array, "H B T V"],
   v_new: Float[Array, "H B T V"],
-  qg: Float[Array, "H B T K"],
-  kg: Float[Array, "H B T K"],
-  w: Float[Array, "H B T K"],
+  qg: Float[Array, "H B T K"] | None,
+  kg: Float[Array, "H B T K"] | None,
+  w: Float[Array, "H B T K"] | None,
   g: Float[Array, "H B T GW"],
   beta: Float[Array, "H B T"],
   A: Float[Array, "H B T BT"],
@@ -1179,9 +1191,11 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     assert dht.shape[1] == N, f"dht has N={dht.shape[1]}, expected {N}"
   dht_arr = dht if dht is not None else jnp.zeros((B, N, H, K, V), dtype=jnp.float32)
 
+  has_qg_kg_w = qg is not None and kg is not None and w is not None
   if mini_batch is None:
     elem_size = 2 if q.dtype == jnp.bfloat16 else 4
-    io_per_head = (8 * BT * K + 4 * BT * V + BT + 3 * BT * BT + 2 * K * V) * elem_size + (
+    num_k_io = 8 if has_qg_kg_w else 5
+    io_per_head = (num_k_io * BT * K + 4 * BT * V + BT + 3 * BT * BT + 2 * K * V) * elem_size + (
       K * V + 5 * BT * K + BT * V + BT + 2 * BT * BT + K * V
     ) * 4
     per_head = io_per_head + io_per_head * 3 // 2
@@ -1208,9 +1222,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   k_r = k.reshape(H, B, NT, BT, K)
   v_r = v.reshape(H, B, NT, BT, V)
   vn_r = v_new.reshape(H, B, NT, BT, V)
-  qg_r = qg.reshape(H, B, NT, BT, K)
-  kg_r = kg.reshape(H, B, NT, BT, K)
-  w_r = w.reshape(H, B, NT, BT, K)
+  qg_r = qg.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
+  kg_r = kg.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
+  w_r = w.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
   GW = g.shape[-1]
   scalar_gate = GW == 1
   # Store width-1 axes as [.., 1, BT] to avoid 128-lane minor-axis padding in HBM.
@@ -1236,6 +1250,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   dht_arr = dht_arr.transpose(2, 0, 1, 3, 4)
 
   qk_spec = pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk)
+  qgw_spec = qk_spec if has_qg_kg_w else None
   g_spec = (
     pl.BlockSpec((MB, 1, 1, 1, BT), index_map=idx_chunk) if scalar_gate
     else pl.BlockSpec((MB, 1, 1, BT, GW), index_map=idx_chunk)
@@ -1278,9 +1293,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         qk_spec,
         v_spec,
         v_spec,
-        qk_spec,
-        qk_spec,
-        qk_spec,
+        qgw_spec,
+        qgw_spec,
+        qgw_spec,
         g_spec,
         b_spec,
         A_spec,
@@ -1580,6 +1595,7 @@ def chunk_kda_bwd_custom(
   a_log = residuals.a_log
   delta_time_bias = residuals.delta_time_bias
   h = residuals.h
+  v_new = residuals.v_new
   g_dtype_marker = residuals.g_dtype_marker
   rstd_q = residuals.q_rstd
   rstd_k = residuals.k_rstd
@@ -1707,23 +1723,28 @@ def chunk_kda_bwd_custom(
     if h.shape[2] != NT:
       raise ValueError(f"saved h has NT={h.shape[2]}, expected {NT}")
 
-    # M1 fusion: recompute w/qg/kg + v_new in one kernel (no u HBM round-trip).
-    # Broadcast scalar gate to key width K for the recompute helper.
     assert g is not None
-    g_wide = (
-      g if g.shape[-1] == q.shape[-1]
-      else jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
-    )
-    w, qg, kg, v_new = fused_recompute_w_u_vnew_from_h_pallas(
-      q=q,
-      k=k,
-      v=v,
-      beta=beta,
-      A=Akk,
-      g=g_wide,
-      h=h,
-      chunk_size=BT,
-    )
+    if v_new is not None:
+      # v_new was saved in forward residuals; w, qg, kg are computed on-the-fly
+      # in VMEM inside _fused_dhu_wy_intra_cumsum_kernel.
+      w, qg, kg = None, None, None
+    else:
+      # M1 fusion: recompute w/qg/kg + v_new in one kernel (no u HBM round-trip).
+      # Broadcast scalar gate to key width K for the recompute helper.
+      g_wide = (
+        g if g.shape[-1] == q.shape[-1]
+        else jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
+      )
+      w, qg, kg, v_new = fused_recompute_w_u_vnew_from_h_pallas(
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,
+        A=Akk,
+        g=g_wide,
+        h=h,
+        chunk_size=BT,
+      )
   else:
     # Path B: full recompute fallback.
     if use_gate_in_kernel:
@@ -1773,6 +1794,7 @@ def chunk_kda_bwd_custom(
     if cu_seqlens is not None and h.shape[2] < NT:
       h = jnp.pad(h, ((0, 0), (0, 0), (0, NT - h.shape[2]), (0, 0), (0, 0)))
 
+  assert v_new is not None
   # ---- Stage 1: dAqk and initial dv ----
   dAqk, dv = chunk_kda_bwd_dAv_kernel(
     q=q,
@@ -1803,6 +1825,21 @@ def chunk_kda_bwd_custom(
       segment_ids = jnp.pad(segment_ids, pad_width)
     elif T_seg > T:
       segment_ids = segment_ids[..., :T]
+    if qg is None or kg is None or w is None:
+      assert g is not None
+      g_wide = (
+        g if g.shape[-1] == q.shape[-1]
+        else jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
+      )
+      w, _, qg, kg = _recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=Akk,
+        q=q,
+        gk=g_wide,
+        chunk_size=BT,
+      )
     # Inputs already in [H, B, T, X]; pre_process consumes this layout
     # directly (no transpose round-trip).
     dS_ext, dM = chunk_gated_delta_rule_bwd_dhu_pre_process(

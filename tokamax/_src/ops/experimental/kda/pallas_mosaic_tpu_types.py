@@ -60,3 +60,4 @@ class KdaResiduals:
   aligned_segment_ids: Int[Array, "B T_ALIGNED"] | None
   segment_ids: Int[Array, "B T_ORIG"] | None
   cp_metadata: CpMetadata
+  v_new: Float[Array, "H B T_ALIGNED V"] | None = None

@@ -1640,7 +1640,7 @@ def chunk_kda_fwd_custom(
     scale=scale,
     chunk_size=BT,
     store_h=disable_recompute,
-    store_v_new=False,
+    store_v_new=disable_recompute,
   )
   if not _is_varlen and final_state is not None:
     final_state = final_state[:, 0]
@@ -1697,5 +1697,6 @@ def chunk_kda_fwd_custom(
       aligned_segment_ids=aligned_segment_ids,
       segment_ids=segment_ids,
       cp_metadata=cp_metadata,
+      v_new=v_new,
   )
   return output, residuals

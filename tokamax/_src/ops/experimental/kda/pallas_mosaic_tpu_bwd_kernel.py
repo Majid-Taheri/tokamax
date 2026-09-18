@@ -1093,20 +1093,15 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     bq, bk, bg, bb, bdAqk, dAkk_local, dq_acc, dk_acc, db_acc, dg_acc,
     precision=precision, per_channel_gate=per_channel_gate,
   )
-  # Sum over channels first, then take the cumsum. `compute_reverse_cumsum_dg`
-  # is a single `dot_general` that contracts the sequence axis and leaves the
-  # channel axis free, so it is linear in the channels and the two operations
-  # commute. A scalar gate wants the channel sum anyway, so doing it first runs
-  # the matmul at width 1 instead of width K. Same result, K times less work.
-  if _gate_narrow:
-    dg_total = jnp.sum(dg_total, axis=-1, keepdims=True)
   dg_reverse_cumsum = compute_reverse_cumsum_dg(dg_total)
 
   dq_ref[:, 0, 0] = dq_total.astype(dq_ref.dtype)
   dk_ref[:, 0, 0] = dk_total.astype(dk_ref.dtype)
   dv_ref[:, 0, 0] = (b_dvb * bb[:, :, None]).astype(dv_ref.dtype)
   db_ref[:, 0, 0, 0] = db_total.astype(db_ref.dtype)
-  # The scalar-gate channel sum already happened, before the cumsum above.
+  # Sum per-channel gate gradients when using a scalar gate.
+  if _gate_narrow:
+    dg_reverse_cumsum = jnp.sum(dg_reverse_cumsum, axis=-1, keepdims=True)
   if dg_ref.shape[-2] == 1:
     dg_ref[:, 0, 0, 0] = dg_reverse_cumsum[..., 0].astype(dg_ref.dtype)
   else:

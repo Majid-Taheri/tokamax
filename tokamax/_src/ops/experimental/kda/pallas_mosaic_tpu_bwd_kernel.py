@@ -817,6 +817,51 @@ def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
   dAqk_full = jnp.where(causal_mask[None], dAqk, 0.0).astype(jnp.float32)
   dAkk_full = dAkk.astype(jnp.float32)
 
+  if not per_channel_gate:
+    # Scalar gate: skip the BC-block decomposition entirely.
+    #
+    # The blocking exists only because a per-channel gate needs a reference row
+    # per block to keep `exp2` bounded. A scalar gate does not: under the causal
+    # mask `gs[r] - gs[c]` is already <= 0, so the whole [BT, BT] decay can be
+    # formed in one go and folded straight into the cotangents. That is the same
+    # regrouping the diagonal blocks already used, applied to all of them.
+    #
+    # The win is MXU occupancy, not instruction count. The blocked form issues 8
+    # batched matmuls whose contraction dimension is BC=16, which uses 16 of the
+    # MXU's 128 contraction rows. This issues 4 whose contraction is BT=64.
+    # Identical FLOPs, four times the tile utilisation, and no reference-point
+    # rescaling on either side of them.
+    #
+    # Deliberately NOT the narrowing that the plan called fix 2: swapping a
+    # width-128 elementwise for a width-16 one buys nothing, because a size-16
+    # minor axis still pads to 128 lanes. That is the lesson from fix 3.
+    gs = bg[:, :, 0]                                            # [MB, BT]
+    _r = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
+    _c = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
+    _causal = (_r >= _c)[None]
+    _diff = gs[:, :, None] - gs[:, None, :]                     # [MB, BT, BT]
+    decay = jnp.where(_causal, jnp.exp2(jnp.where(_causal, _diff, 0.0)), 0.0)
+
+    dAqk_d = dAqk_full * decay
+    dAkk_d = dAkk_full * decay
+    _b1 = (((2,), (1,)), ((0,), (0,)))
+    _b1t = (((1,), (1,)), ((0,), (0,)))
+    _dot = lambda a, b, d: jax.lax.dot_general(
+      a, b, d, preferred_element_type=jnp.float32, precision=precision)
+
+    dq_intra = _dot(dAqk_d, bk, _b1)
+    dk_row_pre = _dot(dAkk_d, bk, _b1)
+    # beta indexes the row, matching the blocked path's `dAkk_diag * beta_b`.
+    dk_col = (_dot(dAqk_d, bq, _b1t)
+              + _dot(dAkk_d * bb[:, :, None], bk, _b1t))
+
+    db_intra = jnp.sum(bk * dk_row_pre, axis=-1)
+    dk_row = bb[:, :, None] * dk_row_pre
+    dk_intra = dk_row + dk_col
+    dg_intra = bq * dq_intra + bk * (dk_row - dk_col)
+    return (dq_acc + dq_intra, dk_acc + dk_intra,
+            db_acc + db_intra, dg_acc + dg_intra)
+
   BC = min(16, BT)
   NC = BT // BC
 

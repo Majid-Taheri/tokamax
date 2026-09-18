@@ -41,6 +41,7 @@ from tokamax._src.ops.experimental.kda.utils import (
   _unalign_output,
   align_up,
   exp2,
+  get_chain_precision,
   get_interpret,
   prepare_chunk_indices,
 )
@@ -721,8 +722,12 @@ def _fused_gate_intra_kernel(
   else:
     out_refs = conv_in_and_out_refs
 
-  u_out_ref, w_out_ref, qg_out_ref, kg_out_ref, Aqk_out_ref, Akk_inv_out_ref, g_cumsum_out_ref = out_refs[:7]
-  extra_out_refs = out_refs[7:]
+  # `qg` used to be an output here. Nothing ever read it: it is not a field of
+  # `KdaResiduals` and the backward recomputes it. A `pallas_call` output
+  # cannot be dead-code eliminated on its own, so it cost a real 1 GiB/layer
+  # of writes. Removed.
+  u_out_ref, w_out_ref, kg_out_ref, Aqk_out_ref, Akk_inv_out_ref, g_cumsum_out_ref = out_refs[:6]
+  extra_out_refs = out_refs[6:]
 
   # Load all MB heads at once
   q_in = q_ref[:, 0, 0]        # [MB, BT, K]
@@ -917,15 +922,13 @@ def _fused_gate_intra_kernel(
   u = result[:, :, :V]         # [MB, BT, V]
   w = result[:, :, V : V + K]  # [MB, BT, K]
 
-  # --- kg, qg ---
+  # --- kg ---
   g_last = g_cumsum[:, BT - 1 : BT, :]  # [MB, 1, K]
   kg = k_f32 * exp2(g_last - g_cumsum)
-  qg = q_f32 * exp2(g_cumsum) if disable_recompute else jnp.zeros_like(q_f32)
 
   # --- Store all MB heads ---
   u_out_ref[:, 0, 0] = u.astype(u_out_ref.dtype)
   w_out_ref[:, 0, 0] = w.astype(w_out_ref.dtype)
-  qg_out_ref[:, 0, 0] = qg.astype(qg_out_ref.dtype)
   kg_out_ref[:, 0, 0] = kg.astype(kg_out_ref.dtype)
   Aqk_out_ref[:, 0, 0] = Aqk.astype(Aqk_out_ref.dtype)
   Akk_inv_out_ref[:, 0, 0] = A_inv.astype(Akk_inv_out_ref.dtype)
@@ -991,7 +994,6 @@ def pallas_kda_fwd_intra_fused(
 ) -> tuple[
     Float[Array, "H B T K"],
     Float[Array, "H B T V"],
-    Float[Array, "H B T K"] | None,
     Float[Array, "H B T K"],
     Float[Array, "H B T BT"],
     Float[Array, "H B T BT"],
@@ -1004,9 +1006,8 @@ def pallas_kda_fwd_intra_fused(
 ]:
   """Fuses gate cumsum with the fixed-length intra-chunk solve.
 
-  Heads are mini-batched to amortize DMA. `qg` is retained only when
-  `disable_recompute` is true. When `use_conv1d_in_kernel` is true, causal
-  conv1d + SiLU (+ optional L2 norm) are fused into the kernel.
+  Heads are mini-batched to amortize DMA. When `use_conv1d_in_kernel` is
+  true, causal conv1d + SiLU (+ optional L2 norm) are fused into the kernel.
   """
   H, B, T, K = q.shape
   V = v.shape[-1]
@@ -1091,14 +1092,12 @@ def pallas_kda_fwd_intra_fused(
     jax.ShapeDtypeStruct((H, B, NC, BT, V), k.dtype),
     jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
     jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
-    jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
     jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
     jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
     jax.ShapeDtypeStruct((H, B, NC, BT, GW), jnp.float32),
   ]
   out_specs = [
     _make_spec(V),
-    _make_spec(K),
     _make_spec(K),
     _make_spec(K),
     _make_spec(BT),
@@ -1190,17 +1189,13 @@ def pallas_kda_fwd_intra_fused(
     ),
   )(*in_args)
 
-  u_r, w_r, qg_r, kg_r, Aqk_r, Akk_inv_r, g_cumsum_r = pallas_outs[:7]
-  extra_outs = pallas_outs[7:]
+  u_r, w_r, kg_r, Aqk_r, Akk_inv_r, g_cumsum_r = pallas_outs[:6]
+  extra_outs = pallas_outs[6:]
 
   # --- Reshape back to [H, B, T, D] (head-first) ---
   w_out = w_r.reshape(H, B, T, K)
   u_out = u_r.reshape(H, B, T, V)
   kg_out = kg_r.reshape(H, B, T, K)
-  qg_out = (
-    qg_r.reshape(H, B, T, K)
-    if disable_recompute else None
-  )
   Aqk_flat = Aqk_r.reshape(H, B, NC * BT, BT)
   Akk_flat = Akk_inv_r.reshape(H, B, NC * BT, BT)
   g_cumsum_out = g_cumsum_r.reshape(H, B, T, GW)
@@ -1218,7 +1213,6 @@ def pallas_kda_fwd_intra_fused(
   return (
     w_out,
     u_out,
-    qg_out,
     kg_out,
     Aqk_flat,
     Akk_flat,
@@ -1267,7 +1261,7 @@ def kda_fwd_intra_fused(
       Other args configure the intra-chunk solve and gate activation.
 
   Returns:
-      12-tuple: (w, u, qg, kg, Aqk, Akk, g_cumsum, q_norm, k_norm, v_silu, q_rstd, k_rstd).
+      11-tuple: (w, u, kg, Aqk, Akk, g_cumsum, q_norm, k_norm, v_silu, q_rstd, k_rstd).
   """
   assert per_channel_gate is False or chunk_size == 64, (
     f"per-channel gate is validated at chunk_size=64 only; got {chunk_size}"
@@ -1375,10 +1369,12 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
 
   # Stage 3 delta correction: v_new = u - w @ h
   # [MB, BT, K] @ [MB, K, V] -> [MB, BT, V]
-  # HIGHEST precision: v_new feeds directly into the recursive state update.
+  # v_new feeds directly into the recursive state update, so this matmul and
+  # the state update below are the two on the serial chain. Their precision
+  # is switchable; see `get_chain_precision`.
   b_v_new = b_u.astype(jnp.float32) - jnp.matmul(
     b_w.astype(jnp.float32), b_h,
-    precision=jax.lax.Precision.HIGHEST,
+    precision=get_chain_precision(),
     preferred_element_type=jnp.float32,
   )  # [MB, BT, V]
 
@@ -1434,7 +1430,7 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   # [MB, K, BT] @ [MB, BT, V] -> [MB, K, V]
   b_h_new = b_h_new + jnp.matmul(
     b_kg.astype(jnp.float32).transpose(0, 2, 1), b_v_new,
-    precision=jax.lax.Precision.HIGHEST,
+    precision=get_chain_precision(),
     preferred_element_type=jnp.float32,
   )
   scratch_ref[:] = b_h_new
@@ -1813,7 +1809,6 @@ def chunk_kda_fwd_custom(
   (
     w,
     u,
-    qg,
     kg,
     Aqk,
     Akk,
@@ -1948,7 +1943,7 @@ def chunk_kda_fwd_custom(
   # Drop intermediates that backward will recompute or never consume.
   # ------------------------------------------------------------------
   if not save_for_backward:
-    w, u, qg, kg, v_new = None, None, None, None, None
+    w, u, kg, v_new = None, None, None, None
     h = None
     if use_gate_in_kernel:
       g_cumsum = None

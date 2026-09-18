@@ -42,6 +42,40 @@ def get_interpret() -> bool:
   return env.strip().lower() in ("1", "true")
 
 
+def get_chain_precision() -> jax.lax.Precision:
+  """Precision for the two matmuls on the forward's serial recurrent chain.
+
+  `KDA_CHAIN_PRECISION` is one of `highest` (the default, and what shipped),
+  `high`, or `default`. It exists so the three can be compared on hardware
+  without rebuilding an image.
+
+  Why it is worth comparing. Those two matmuls are `w @ h` and `kg^T @ v_new`
+  in `pallas_mosaic_tpu_fwd_kernel`, and together they are about 89% of the
+  recurrent step's matmul work. Both are pinned to `HIGHEST`, which the MXU
+  serves by decomposing each f32 operand into several bf16 passes. But `w` and
+  `kg` are *read from bf16 buffers* and upcast one line earlier, so the extra
+  passes recover mantissa bits those operands never carried. The competing GDN
+  kernel pins no precision at all and relies on `preferred_element_type` for
+  fp32 accumulation, which costs one pass.
+
+  This is not a free change. `v_new` feeds the recurrent state update, so error
+  compounds over 1024 chunks, and CPU interpret mode does not model TPU matmul
+  precision and will not catch it. Judge it on the loss curve, not the clock.
+  `high` is the middle option: 3 passes rather than 6.
+  """
+  env = os.environ.get("KDA_CHAIN_PRECISION", "highest").strip().lower()
+  try:
+    return {
+        "highest": jax.lax.Precision.HIGHEST,
+        "high": jax.lax.Precision.HIGH,
+        "default": jax.lax.Precision.DEFAULT,
+    }[env]
+  except KeyError:
+    raise ValueError(
+        f"KDA_CHAIN_PRECISION must be highest, high or default; got {env!r}."
+    ) from None
+
+
 def cdiv(x, y: int):
   return (x + y - 1) // y
 

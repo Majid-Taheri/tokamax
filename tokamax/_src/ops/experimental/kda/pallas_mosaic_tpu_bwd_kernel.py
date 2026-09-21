@@ -1095,7 +1095,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bb = beta_ref[:, 0, 0, 0].astype(jnp.float32)
   bA = A_ref[:, 0, 0].astype(jnp.float32)
   bh = h_ref[:, 0, 0].astype(jnp.float32)
-  bdo = do_ref[:, 0, 0]
+  bdo = do_ref[:, 0, 0].astype(jnp.float32)
   bdv0 = dv0_ref[:, 0, 0].astype(jnp.float32)
   bdAqk = dAqk_ref[:, 0, 0].astype(jnp.float32)
 
@@ -1413,7 +1413,7 @@ def _chunk_kda_bwd_dAv_kernel(
 ):
   bv = v_ref[:]  # [MB, BT, V]
   bA = A_ref[:]  # [MB, BT, BT]
-  bdo = do_ref[:]  # [MB, BT, V]
+  bdo = do_ref[:].astype(jnp.float32)  # [MB, BT, V], cast in VMEM
   precision = (
       None if A_ref.dtype == jnp.bfloat16 else jax.lax.Precision.HIGHEST
   )
@@ -1537,7 +1537,9 @@ def chunk_kda_bwd_dAv_kernel(
 
   out_shape = [
     jax.ShapeDtypeStruct((total, BT, BT), jnp.float32),
-    jax.ShapeDtypeStruct((total, BT, V), do.dtype),
+    # Pinned f32, not `do.dtype`: this is a partial gradient that M4
+    # accumulates into, so it must not follow the cotangent to bf16.
+    jax.ShapeDtypeStruct((total, BT, V), jnp.float32),
   ]
 
   kernel = partial(
@@ -1679,8 +1681,13 @@ def chunk_kda_bwd_custom(
 ]:
   """Runs the full KDA backward pipeline from forward residuals."""
   do, dht = grad_outputs
-  # JAX cotangents match the bf16 output dtype; backward accumulates in fp32.
-  do = do.astype(jnp.float32)
+  # `do` is left in the dtype JAX handed us, normally bf16, and cast inside each
+  # kernel where it is read into VMEM. Upcasting it here was a whole XLA pass
+  # over the array before any kernel ran: read 1 GiB of bf16, write 2 GiB of
+  # f32, per layer, and then every consumer DMA'd the doubled version. The
+  # upcast adds no information, since the value arrives bf16 either way, and
+  # the accumulators are pinned to f32 by `preferred_element_type` regardless
+  # of the operand dtype.
   q = residuals.q
   k = residuals.k
   v = residuals.v

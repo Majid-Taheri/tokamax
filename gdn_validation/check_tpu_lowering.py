@@ -105,7 +105,20 @@ def main():
     cases.append((f"per-channel gate, chunk  64, remat={remat!s:<5}",
                   K, True, remat, 64))
 
+  # KNOWN GAP, and it cost a run. Everything here is float32, because the bf16
+  # path calls `jax._src.tpu_info.get_tpu_info` from inside lowering and there
+  # is no way to satisfy it from a CPU host that I have found; patching the
+  # `pltpu` alias is not enough. So a bug that only exists in bf16 passes this
+  # gate and every other CPU gate.
+  #
+  # The class to watch for: a store written as `x.astype(some_input_ref.dtype)`
+  # into an output ref whose dtype is pinned independently. Those two agree in a
+  # float32 test and disagree on the chip. Exactly that shipped in 503842a,
+  # where `dv_ref` was pinned to f32 while `do_ref` became bf16, and it was
+  # caught by TPU tracing rather than here. Grep for `.astype(` on a `_ref.dtype`
+  # before launching.
   print("lowering for TPU from a CPU host -- block shapes, not codegen")
+  print("NOTE: float32 only. bf16-only bugs are not caught here.")
   print(f"H={H} B={B} T={T} K={K}\n")
 
   failures = []

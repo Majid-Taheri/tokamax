@@ -1456,7 +1456,10 @@ def _chunk_kda_bwd_dAv_kernel(
   b_dA = jnp.where(m_causal[None, :, :], b_dA * scale, 0.0)
 
   dA_ref[:] = b_dA
-  dv_ref[:] = b_dv.astype(do_ref.dtype)
+  # `dv_ref.dtype`, not `do_ref.dtype`. The output is pinned to f32 because it
+  # is a partial gradient; the cotangent is now bf16. Tying the store to the
+  # input dtype makes them disagree the moment those two differ.
+  dv_ref[:] = b_dv.astype(dv_ref.dtype)
 
 
 @functools.partial(

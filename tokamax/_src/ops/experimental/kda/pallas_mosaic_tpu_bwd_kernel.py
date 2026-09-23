@@ -1026,6 +1026,17 @@ def compute_reverse_cumsum_dg(dg_total):
     precision=jax.lax.Precision.HIGHEST,
   ).transpose(1, 0, 2)
 
+
+@jax.jit
+def compute_forward_cumsum_g(g_raw):
+  BT = g_raw.shape[1]
+  idx = jnp.arange(BT, dtype=jnp.int32)
+  cumsum_mask = (idx[:, None] >= idx[None, :]).astype(jnp.float32)
+  return jax.lax.dot_general(
+    cumsum_mask, g_raw, (((1,), (1,)), ((), ())),
+    precision=jax.lax.Precision.HIGHEST,
+  ).transpose(1, 0, 2)
+
 # =====================================================================
 # M4: dhu + WY + intra backward + chunk-local reverse cumsum
 # =====================================================================
@@ -1082,12 +1093,14 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bq = q_ref[:, 0, 0].astype(jnp.float32)
   bk = k_ref[:, 0, 0].astype(jnp.float32)
   bv = v_ref[:, 0, 0].astype(jnp.float32)
-  bvn = v_new_ref[:, 0, 0].astype(jnp.float32)
   # Transpose scalar gate from [.., 1, BT] back to [MB, BT, 1] and broadcast to K in VMEM.
   if g_ref.shape[-2] == 1:
     bg = g_ref[:, 0, 0, 0].astype(jnp.float32)[..., None]
   else:
     bg = g_ref[:, 0, 0].astype(jnp.float32)
+  if v_new_ref is None:
+    bg = compute_forward_cumsum_g(bg)
+  bg_scalar = bg
   _gate_narrow = bg.shape[-1] != K
   if _gate_narrow:
     bg = jnp.broadcast_to(bg, bg.shape[:-1] + (K,))
@@ -1096,8 +1109,6 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bA = A_ref[:, 0, 0].astype(jnp.float32)
   bh = h_ref[:, 0, 0].astype(jnp.float32)
   bdo = do_ref[:, 0, 0].astype(jnp.float32)
-  bdv0 = dv0_ref[:, 0, 0].astype(jnp.float32)
-  bdAqk = dAqk_ref[:, 0, 0].astype(jnp.float32)
 
   if qg_ref is not None and kg_ref is not None and w_ref is not None:
     bqg = qg_ref[:, 0, 0].astype(jnp.float32)
@@ -1113,6 +1124,46 @@ def _fused_dhu_wy_intra_cumsum_kernel(
         precision=precision,
         preferred_element_type=jnp.float32,
     ).astype(k_ref.dtype).astype(jnp.float32)
+
+  if v_new_ref is not None:
+    bvn = v_new_ref[:, 0, 0].astype(jnp.float32)
+    bdv0 = dv0_ref[:, 0, 0].astype(jnp.float32)
+    bdAqk = dAqk_ref[:, 0, 0].astype(jnp.float32)
+  else:
+    bu = jnp.matmul(
+        bA,
+        (bv * bb[:, :, None]).astype(jnp.float32),
+        precision=precision,
+        preferred_element_type=jnp.float32,
+    ).astype(v_ref.dtype).astype(jnp.float32)
+    bvn = bu - jnp.matmul(
+        bw,
+        bh,
+        precision=precision,
+        preferred_element_type=jnp.float32,
+    )
+    idx_bt = jnp.arange(BT, dtype=jnp.int32)
+    m_causal = idx_bt[:, None] >= idx_bt[None, :]
+    diff_g = bg_scalar - jnp.swapaxes(bg_scalar, 1, 2)
+    safe_diff = jnp.where(m_causal[None, :, :], diff_g, 0.0)
+    decay_mat = jnp.where(m_causal[None, :, :], jnp.exp2(safe_diff), 0.0)
+    qk_dot = jax.lax.dot_general(
+        bq, bk, (((2,), (2,)), ((0,), (0,))),
+        precision=precision,
+        preferred_element_type=jnp.float32,
+    )
+    bAqk = qk_dot * decay_mat * scale
+    do_vn_dot = jax.lax.dot_general(
+        bdo, bvn, (((2,), (2,)), ((0,), (0,))),
+        precision=precision,
+        preferred_element_type=jnp.float32,
+    )
+    bdAqk = jnp.where(m_causal[None, :, :], do_vn_dot * scale, 0.0)
+    bdv0 = jax.lax.dot_general(
+        bAqk, bdo, (((1,), (1,)), ((0,), (0,))),
+        precision=precision,
+        preferred_element_type=jnp.float32,
+    )
 
   # --- dhu reverse recurrence ---
   bdv, dh_new = compute_dhu_recurrence(
@@ -1174,7 +1225,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   q: Float[Array, "H B T K"],
   k: Float[Array, "H B T K"],
   v: Float[Array, "H B T V"],
-  v_new: Float[Array, "H B T V"],
+  v_new: Float[Array, "H B T V"] | None,
   qg: Float[Array, "H B T K"] | None,
   kg: Float[Array, "H B T K"] | None,
   w: Float[Array, "H B T K"] | None,
@@ -1183,8 +1234,8 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   A: Float[Array, "H B T BT"],
   h: Float[Array, "H B NT K V"],
   do: Float[Array, "H B T V"],
-  dv0: Float[Array, "H B T V"],
-  dAqk: Float[Array, "H B T BT"],
+  dv0: Float[Array, "H B T V"] | None,
+  dAqk: Float[Array, "H B T BT"] | None,
   dht: Float[Array, "B N H K V"] | None,
   scale: float,
   *,
@@ -1237,6 +1288,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   dht_arr = dht if dht is not None else jnp.zeros((B, N, H, K, V), dtype=jnp.float32)
 
   has_qg_kg_w = qg is not None and kg is not None and w is not None
+  has_vn_dv0_dAqk = v_new is not None and dv0 is not None and dAqk is not None
   if mini_batch is None:
     elem_size = 2 if q.dtype == jnp.bfloat16 else 4
     num_k_io = 8 if has_qg_kg_w else 5
@@ -1266,7 +1318,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   q_r = q.reshape(H, B, NT, BT, K)
   k_r = k.reshape(H, B, NT, BT, K)
   v_r = v.reshape(H, B, NT, BT, V)
-  vn_r = v_new.reshape(H, B, NT, BT, V)
+  vn_r = v_new.reshape(H, B, NT, BT, V) if has_vn_dv0_dAqk else None
   qg_r = qg.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
   kg_r = kg.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
   w_r = w.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
@@ -1279,8 +1331,8 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   A_r = A.reshape(H, B, NT, BT, BT)
   h_r = h  # already [H, B, NT, K, V]
   do_r = do.reshape(H, B, NT, BT, V)
-  dv0_r = dv0.reshape(H, B, NT, BT, V)
-  dAqk_r = dAqk.reshape(H, B, NT, BT, BT)
+  dv0_r = dv0.reshape(H, B, NT, BT, V) if has_vn_dv0_dAqk else None
+  dAqk_r = dAqk.reshape(H, B, NT, BT, BT) if has_vn_dv0_dAqk else None
 
   def idx_chunk(head_group, batch, chunk, chunk_seg_ids_ref):
     return (head_group, batch, NT - 1 - chunk, 0, 0)
@@ -1296,13 +1348,15 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
 
   qk_spec = pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk)
   qgw_spec = qk_spec if has_qg_kg_w else None
+  v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
+  vn_dv0_spec = v_spec if has_vn_dv0_dAqk else None
   g_spec = (
     pl.BlockSpec((MB, 1, 1, 1, BT), index_map=idx_chunk) if scalar_gate
     else pl.BlockSpec((MB, 1, 1, BT, GW), index_map=idx_chunk)
   )
-  v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
   b_spec = pl.BlockSpec((MB, 1, 1, 1, BT), index_map=idx_chunk)
   A_spec = pl.BlockSpec((MB, 1, 1, BT, BT), index_map=idx_chunk)
+  dAqk_spec = A_spec if has_vn_dv0_dAqk else None
   h_spec = pl.BlockSpec((MB, 1, 1, K, V), index_map=idx_chunk)
   state_spec = pl.BlockSpec((MB, 1, 1, K, V), index_map=idx_state)
 
@@ -1337,7 +1391,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         qk_spec,
         qk_spec,
         v_spec,
-        v_spec,
+        vn_dv0_spec,
         qgw_spec,
         qgw_spec,
         qgw_spec,
@@ -1346,8 +1400,8 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         A_spec,
         h_spec,
         v_spec,
-        v_spec,
-        A_spec,
+        vn_dv0_spec,
+        dAqk_spec,
         state_spec,
       ],
       out_specs=[qk_spec, qk_spec, v_spec, b_spec, g_spec, state_spec],
@@ -1359,6 +1413,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       vmem_limit_bytes=get_tpu_limits().vmem_limit_bytes,
     ),
     interpret=get_interpret(),
+    name="_fused_dhu_wy_intra_cumsum_pallas_jit",
   )(
     chunk_seg_ids,
     q_r,

@@ -1074,7 +1074,6 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   scale,
   MB,
   per_channel_gate=True,
-  batch_first=False,
 ):
   """Fuse Dhu, WY, intra backward, and reverse cumsum for one chunk tile."""
   head_group = pl.program_id(0)
@@ -1091,19 +1090,9 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     dh_tmp_ref[:] = dht_ref[:, 0, 0, :].astype(dh_tmp_ref.dtype)
 
   dh = dh_tmp_ref[:].astype(jnp.float32)
-  # `batch_first` reads the caller's own `[B, T, H, D]` layout rather than
-  # demanding `[H, B, T, D]`. The block lands in VMEM as `[BT, MB, D]` and the
-  # body wants `[MB, BT, D]`, so there is one on-chip transpose per operand.
-  # Not free -- it is a VMEM relayout -- but it replaces a full HBM round trip
-  # per tensor per layer, measured at 575.76 ms/step against Rohan's 348.95.
-  if batch_first:
-    _ld = lambda r: r[0, 0].transpose(1, 0, 2).astype(jnp.float32)
-  else:
-    _ld = lambda r: r[:, 0, 0].astype(jnp.float32)
-
-  bq = _ld(q_ref)
-  bk = _ld(k_ref)
-  bv = _ld(v_ref)
+  bq = q_ref[:, 0, 0].astype(jnp.float32)
+  bk = k_ref[:, 0, 0].astype(jnp.float32)
+  bv = v_ref[:, 0, 0].astype(jnp.float32)
   # Transpose scalar gate from [.., 1, BT] back to [MB, BT, 1] and broadcast to K in VMEM.
   if g_ref.shape[-2] == 1:
     bg = g_ref[:, 0, 0, 0].astype(jnp.float32)[..., None]
@@ -1119,7 +1108,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bb = beta_ref[:, 0, 0, 0].astype(jnp.float32)
   bA = A_ref[:, 0, 0].astype(jnp.float32)
   bh = h_ref[:, 0, 0].astype(jnp.float32)
-  bdo = _ld(do_ref)
+  bdo = do_ref[:, 0, 0].astype(jnp.float32)
 
   if qg_ref is not None and kg_ref is not None and w_ref is not None:
     bqg = qg_ref[:, 0, 0].astype(jnp.float32)
@@ -1137,9 +1126,8 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     ).astype(k_ref.dtype).astype(jnp.float32)
 
   if v_new_ref is not None:
-    bvn = _ld(v_new_ref)
-    bdv0 = _ld(dv0_ref)
-    # dAqk is [.., BT, BT], square, so it stays head-first in both layouts.
+    bvn = v_new_ref[:, 0, 0].astype(jnp.float32)
+    bdv0 = dv0_ref[:, 0, 0].astype(jnp.float32)
     bdAqk = dAqk_ref[:, 0, 0].astype(jnp.float32)
   else:
     bu = jnp.matmul(
@@ -1203,13 +1191,9 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   )
   dg_reverse_cumsum = compute_reverse_cumsum_dg(dg_total)
 
-  if batch_first:
-    _st = lambda r, x: r.__setitem__((0, 0), x.transpose(1, 0, 2).astype(r.dtype))
-  else:
-    _st = lambda r, x: r.__setitem__((slice(None), 0, 0), x.astype(r.dtype))
-  _st(dq_ref, dq_total)
-  _st(dk_ref, dk_total)
-  _st(dv_ref, b_dvb * bb[:, :, None])
+  dq_ref[:, 0, 0] = dq_total.astype(dq_ref.dtype)
+  dk_ref[:, 0, 0] = dk_total.astype(dk_ref.dtype)
+  dv_ref[:, 0, 0] = (b_dvb * bb[:, :, None]).astype(dv_ref.dtype)
   db_ref[:, 0, 0, 0] = db_total.astype(db_ref.dtype)
   # Sum per-channel gate gradients when using a scalar gate.
   if _gate_narrow:
@@ -1234,19 +1218,14 @@ def _fused_dhu_wy_intra_cumsum_kernel(
       "return_dh0",
       "max_num_segments",
       "per_channel_gate",
-      "batch_first",
   ],
 )
 @jaxtyping.jaxtyped
 def _fused_dhu_wy_intra_cumsum_pallas_jit(
-  # These carry `[H, B, T, D]` by default and `[B, T, H, D]` under
-  # `batch_first`, so they cannot be pinned to named axes: jaxtyping binds a
-  # name on first sight, so "H B T K" here would bind H to the batch and then
-  # reject every later argument. The rest keep their annotations.
-  q: Float[Array, "..."],
-  k: Float[Array, "..."],
-  v: Float[Array, "..."],
-  v_new: Float[Array, "..."] | None,
+  q: Float[Array, "H B T K"],
+  k: Float[Array, "H B T K"],
+  v: Float[Array, "H B T V"],
+  v_new: Float[Array, "H B T V"] | None,
   qg: Float[Array, "H B T K"] | None,
   kg: Float[Array, "H B T K"] | None,
   w: Float[Array, "H B T K"] | None,
@@ -1254,8 +1233,8 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   beta: Float[Array, "H B T"],
   A: Float[Array, "H B T BT"],
   h: Float[Array, "H B NT K V"],
-  do: Float[Array, "..."],
-  dv0: Float[Array, "..."] | None,
+  do: Float[Array, "H B T V"],
+  dv0: Float[Array, "H B T V"] | None,
   dAqk: Float[Array, "H B T BT"] | None,
   dht: Float[Array, "B N H K V"] | None,
   scale: float,
@@ -1267,11 +1246,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   mini_batch: int | None = None,
   return_dh0: bool = True,
   max_num_segments: int | None = None,
-  batch_first: bool = False,
 ) -> tuple[
-  Float[Array, "..."],
-  Float[Array, "..."],
-  Float[Array, "..."],
+  Float[Array, "H B T K"],
+  Float[Array, "H B T K"],
+  Float[Array, "H B T V"],
   Float[Array, "H B T"],
   Float[Array, "H B T GW"],
   Float[Array, "B N_OUT H K V"] | None,
@@ -1281,11 +1259,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   `segment_ids` applies per-batch varlen boundaries, and `return_dh0`
   controls whether the initial-state gradient is materialized.
   """
-  # `q` is `[B, T, H, K]` under `batch_first`, `[H, B, T, K]` otherwise.
-  if batch_first:
-    B, T, H, K = q.shape
-  else:
-    H, B, T, K = q.shape
+  H, B, T, K = q.shape
   V = v.shape[-1]
   BT = chunk_size
   NT = T // BT
@@ -1341,17 +1315,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
 
   # Keep [H, B, ...] layout; reshape T → (NT, BT) only. No transpose.
   # B is an independent dimension handled by a separate grid axis.
-  # Only the large tensors follow `batch_first`. The gate, beta, A, h and the
-  # state stay head-first: their narrow `[.., 1, BT]` layout pads 2x, where a
-  # batch-first `[.., BT, MB]` puts MB=16 on the minor axis and pads 8x.
-  if batch_first:
-    _r5 = lambda x, d: x.reshape(B, NT, BT, H, d)
-  else:
-    _r5 = lambda x, d: x.reshape(H, B, NT, BT, d)
-  q_r = _r5(q, K)
-  k_r = _r5(k, K)
-  v_r = _r5(v, V)
-  vn_r = _r5(v_new, V) if has_vn_dv0_dAqk else None
+  q_r = q.reshape(H, B, NT, BT, K)
+  k_r = k.reshape(H, B, NT, BT, K)
+  v_r = v.reshape(H, B, NT, BT, V)
+  vn_r = v_new.reshape(H, B, NT, BT, V) if has_vn_dv0_dAqk else None
   qg_r = qg.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
   kg_r = kg.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
   w_r = w.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
@@ -1363,16 +1330,12 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   beta_r = beta.reshape(H, B, NT, 1, BT)
   A_r = A.reshape(H, B, NT, BT, BT)
   h_r = h  # already [H, B, NT, K, V]
-  do_r = _r5(do, V)
-  dv0_r = _r5(dv0, V) if has_vn_dv0_dAqk else None
+  do_r = do.reshape(H, B, NT, BT, V)
+  dv0_r = dv0.reshape(H, B, NT, BT, V) if has_vn_dv0_dAqk else None
   dAqk_r = dAqk.reshape(H, B, NT, BT, BT) if has_vn_dv0_dAqk else None
 
   def idx_chunk(head_group, batch, chunk, chunk_seg_ids_ref):
     return (head_group, batch, NT - 1 - chunk, 0, 0)
-
-  def idx_chunk_bf(head_group, batch, chunk, chunk_seg_ids_ref):
-    """The same walk over a `[B, NT, BT, H, D]` array."""
-    return (batch, NT - 1 - chunk, 0, head_group, 0)
 
 
   def idx_state(head_group, batch, chunk, chunk_seg_ids_ref):
@@ -1383,15 +1346,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   # dht_arr [B, N, H, K, V] → [H, B, N, K, V]
   dht_arr = dht_arr.transpose(2, 0, 1, 3, 4)
 
-  if batch_first:
-    _spec5 = lambda d: pl.BlockSpec((1, 1, BT, MB, d), index_map=idx_chunk_bf)
-  else:
-    _spec5 = lambda d: pl.BlockSpec((MB, 1, 1, BT, d), index_map=idx_chunk)
-  qk_spec = _spec5(K)
-  # qg/kg/w only arrive on the legacy path and are always head-first.
-  qgw_spec = (pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk)
-              if has_qg_kg_w else None)
-  v_spec = _spec5(V)
+  qk_spec = pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk)
+  qgw_spec = qk_spec if has_qg_kg_w else None
+  v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
   vn_dv0_spec = v_spec if has_vn_dv0_dAqk else None
   g_spec = (
     pl.BlockSpec((MB, 1, 1, 1, BT), index_map=idx_chunk) if scalar_gate
@@ -1407,7 +1364,6 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     _fused_dhu_wy_intra_cumsum_kernel,
     scale=scale,
     per_channel_gate=per_channel_gate,
-    batch_first=batch_first,
     BT=BT,
     K=K,
     V=V,
@@ -1415,14 +1371,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     MB=MB,
   )
   dh_tmp = pltpu.VMEM((MB, K, V), jnp.float32)
-  if batch_first:
-    _osh = lambda d: jax.ShapeDtypeStruct((B, NT, BT, H, d), jnp.float32)
-  else:
-    _osh = lambda d: jax.ShapeDtypeStruct((H, B, NT, BT, d), jnp.float32)
   out_shape = [
-    _osh(K),
-    _osh(K),
-    _osh(V),
+    jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
+    jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
+    jax.ShapeDtypeStruct((H, B, NT, BT, V), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, 1, BT), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, 1, BT), jnp.float32) if scalar_gate
     else jax.ShapeDtypeStruct((H, B, NT, BT, GW), jnp.float32),
@@ -1482,15 +1434,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   )
 
   dh0_out = dh0_r.transpose(1, 2, 0, 3, 4) if return_dh0 else None
-  # Under `batch_first` the three gradients stay batch-first for the caller.
-  if batch_first:
-    _o4 = lambda x, d: x.reshape(B, T, H, d)
-  else:
-    _o4 = lambda x, d: x.reshape(H, B, T, d)
   return (
-    _o4(dq_r, K),
-    _o4(dk_r, K),
-    _o4(dv_r, V),
+    dq_r.reshape(H, B, T, K),
+    dk_r.reshape(H, B, T, K),
+    dv_r.reshape(H, B, T, V),
     db_r.reshape(H, B, T),
     dg_r.reshape(H, B, T, GW),
     dh0_out,

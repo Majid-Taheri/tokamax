@@ -1074,6 +1074,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   scale,
   MB,
   per_channel_gate=True,
+  gqa_repeats=1,
 ):
   """Fuse Dhu, WY, intra backward, and reverse cumsum for one chunk tile."""
   head_group = pl.program_id(0)
@@ -1090,8 +1091,17 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     dh_tmp_ref[:] = dht_ref[:, 0, 0, :].astype(dh_tmp_ref.dtype)
 
   dh = dh_tmp_ref[:].astype(jnp.float32)
+  # Native GQA. q and k arrive at the *key* head count, MB // gqa_repeats of
+  # them per tile, and are broadcast up to MB value heads here in VMEM. The
+  # caller used to do this with `jnp.repeat` in HBM, which made q, k, dq and dk
+  # four times larger in memory and cost ~195 ms/step in expand, reduce and the
+  # L2-norm VJP that rides on them. A broadcast along the leading axis is cheap;
+  # a 4x copy of a gigabyte is not.
   bq = q_ref[:, 0, 0].astype(jnp.float32)
   bk = k_ref[:, 0, 0].astype(jnp.float32)
+  if gqa_repeats > 1:
+    bq = jnp.repeat(bq, gqa_repeats, axis=0)
+    bk = jnp.repeat(bk, gqa_repeats, axis=0)
   bv = v_ref[:, 0, 0].astype(jnp.float32)
   # Transpose scalar gate from [.., 1, BT] back to [MB, BT, 1] and broadcast to K in VMEM.
   if g_ref.shape[-2] == 1:
@@ -1191,6 +1201,14 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   )
   dg_reverse_cumsum = compute_reverse_cumsum_dg(dg_total)
 
+  # Sum the value heads back down to key heads before writing. The caller used
+  # to do this in HBM as `dq.reshape(..., R, D).sum(axis=-2)` on a full
+  # [H, B, T, D] array; here it is a reduction over a leading axis of a tile.
+  if gqa_repeats > 1:
+    _MBQ = dq_ref.shape[0]
+    _red = lambda x: x.reshape(_MBQ, gqa_repeats, *x.shape[1:]).sum(axis=1)
+    dq_total = _red(dq_total)
+    dk_total = _red(dk_total)
   dq_ref[:, 0, 0] = dq_total.astype(dq_ref.dtype)
   dk_ref[:, 0, 0] = dk_total.astype(dk_ref.dtype)
   dv_ref[:, 0, 0] = (b_dvb * bb[:, :, None]).astype(dv_ref.dtype)
@@ -1218,12 +1236,14 @@ def _fused_dhu_wy_intra_cumsum_kernel(
       "return_dh0",
       "max_num_segments",
       "per_channel_gate",
+      "gqa_repeats",
   ],
 )
 @jaxtyping.jaxtyped
 def _fused_dhu_wy_intra_cumsum_pallas_jit(
-  q: Float[Array, "H B T K"],
-  k: Float[Array, "H B T K"],
+  # `H_QK` is `H // gqa_repeats`, and equals H when gqa_repeats is 1.
+  q: Float[Array, "H_QK B T K"],
+  k: Float[Array, "H_QK B T K"],
   v: Float[Array, "H B T V"],
   v_new: Float[Array, "H B T V"] | None,
   qg: Float[Array, "H B T K"] | None,
@@ -1246,9 +1266,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   mini_batch: int | None = None,
   return_dh0: bool = True,
   max_num_segments: int | None = None,
+  gqa_repeats: int = 1,
 ) -> tuple[
-  Float[Array, "H B T K"],
-  Float[Array, "H B T K"],
+  Float[Array, "H_QK B T K"],
+  Float[Array, "H_QK B T K"],
   Float[Array, "H B T V"],
   Float[Array, "H B T"],
   Float[Array, "H B T GW"],
@@ -1259,7 +1280,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   `segment_ids` applies per-batch varlen boundaries, and `return_dh0`
   controls whether the initial-state gradient is materialized.
   """
-  H, B, T, K = q.shape
+  # `q` and `k` carry the key head count; everything else carries the value
+  # head count. H below is always the value head count.
+  H_QK, B, T, K = q.shape
+  H = H_QK * gqa_repeats
   V = v.shape[-1]
   BT = chunk_size
   NT = T // BT
@@ -1315,8 +1339,8 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
 
   # Keep [H, B, ...] layout; reshape T → (NT, BT) only. No transpose.
   # B is an independent dimension handled by a separate grid axis.
-  q_r = q.reshape(H, B, NT, BT, K)
-  k_r = k.reshape(H, B, NT, BT, K)
+  q_r = q.reshape(H_QK, B, NT, BT, K)
+  k_r = k.reshape(H_QK, B, NT, BT, K)
   v_r = v.reshape(H, B, NT, BT, V)
   vn_r = v_new.reshape(H, B, NT, BT, V) if has_vn_dv0_dAqk else None
   qg_r = qg.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
@@ -1346,8 +1370,13 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   # dht_arr [B, N, H, K, V] → [H, B, N, K, V]
   dht_arr = dht_arr.transpose(2, 0, 1, 3, 4)
 
-  qk_spec = pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk)
-  qgw_spec = qk_spec if has_qg_kg_w else None
+  # q/k blocks carry MB // gqa_repeats key heads for the MB value heads of the
+  # tile. MB divides H and gqa_repeats divides MB, so this is exact.
+  MB_QK = MB // gqa_repeats
+  assert MB % gqa_repeats == 0, f"MB={MB} must be divisible by gqa_repeats={gqa_repeats}"
+  qk_spec = pl.BlockSpec((MB_QK, 1, 1, BT, K), index_map=idx_chunk)
+  # qg/kg/w are per value head on the legacy path.
+  qgw_spec = pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk) if has_qg_kg_w else None
   v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
   vn_dv0_spec = v_spec if has_vn_dv0_dAqk else None
   g_spec = (
@@ -1364,6 +1393,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     _fused_dhu_wy_intra_cumsum_kernel,
     scale=scale,
     per_channel_gate=per_channel_gate,
+    gqa_repeats=gqa_repeats,
     BT=BT,
     K=K,
     V=V,
@@ -1372,8 +1402,8 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   )
   dh_tmp = pltpu.VMEM((MB, K, V), jnp.float32)
   out_shape = [
-    jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
-    jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
+    jax.ShapeDtypeStruct((H_QK, B, NT, BT, K), jnp.float32),
+    jax.ShapeDtypeStruct((H_QK, B, NT, BT, K), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, BT, V), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, 1, BT), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, 1, BT), jnp.float32) if scalar_gate
@@ -1404,7 +1434,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         dAqk_spec,
         state_spec,
       ],
-      out_specs=[qk_spec, qk_spec, v_spec, b_spec, g_spec, state_spec],
+      out_specs=[qk_spec, qk_spec, v_spec, b_spec, g_spec, state_spec],  # dq, dk at H_QK
       scratch_shapes=[dh_tmp],
     ),
     compiler_params=pltpu.CompilerParams(
@@ -1435,8 +1465,8 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
 
   dh0_out = dh0_r.transpose(1, 2, 0, 3, 4) if return_dh0 else None
   return (
-    dq_r.reshape(H, B, T, K),
-    dk_r.reshape(H, B, T, K),
+    dq_r.reshape(H_QK, B, T, K),
+    dk_r.reshape(H_QK, B, T, K),
     dv_r.reshape(H, B, T, V),
     db_r.reshape(H, B, T),
     dg_r.reshape(H, B, T, GW),

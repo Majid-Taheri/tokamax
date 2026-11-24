@@ -32,7 +32,6 @@ from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
-from tokamax._src.pallas import block
 
 
 # pylint: disable=cell-var-from-loop
@@ -58,7 +57,7 @@ class Config(common.ConfigBase):
 
 def _pad_qkv(q, k, v):
   # The sequence dimensions must be a multiple of 8.
-  k, v = map(lambda x: shape_lib.pad_to_next_multiple_of(x, 8, 0), (k, v))
+  q, k, v = map(lambda x: shape_lib.pad_to_next_multiple_of(x, 8, 0), (q, k, v))
   q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
   return q, k, v
 
@@ -213,7 +212,7 @@ def flash_attention_kernel(
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Flash attention with Mosaic GPU."""
 
-  _, num_q_heads, _ = q.shape
+  orig_q_seq_len, num_q_heads, _ = q.shape
   _, num_kv_heads, orig_head_dim_out = v.shape
 
   if num_q_heads % num_kv_heads:
@@ -228,8 +227,21 @@ def flash_attention_kernel(
   block_kv = config.block_kv
   num_stages = config.num_stages
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
+  early_q_consumed = config.persistent and (bias is None or head_dim < 64)
+
+  if bias is not None:
+    if bias.shape[-2] != 1:
+      bias = shape_lib.pad_to_next_multiple_of(bias, 8, -2)
+    if bias.shape[-1] != 1:
+      bias = shape_lib.pad_to_next_multiple_of(
+          bias, 128 // bias.dtype.itemsize, -1
+      )
 
   if mask is not None:
+    if mask.shape[-2] != 1:
+      mask = shape_lib.pad_to_next_multiple_of(mask, 8, -2)
+    if mask.shape[-1] != 1:
+      mask = shape_lib.pad_to_next_multiple_of(mask, 128, -1)
     mask = mask.astype(jnp.int8)
 
   as_2d = lambda x: None if x is None else jax.lax.broadcast_to_rank(x, 2)
@@ -283,7 +295,7 @@ def flash_attention_kernel(
 
         if is_causal:
           q_max = (qi + 1) * (2 * block_q)
-          ub = lax.min(ub, pl.cdiv(q_max, block_kv))
+          ub = lax.min(ub, mgpu_lib.ucdiv(q_max, block_kv))
 
         load_k_minmax = lambda x: _load_bcast(x, (hi, qi), layout=None)
 
@@ -291,13 +303,13 @@ def flash_attention_kernel(
           k_start_max = None
         else:
           k_start_min, k_start_max = map(load_k_minmax, k_start_minmax_gmems)
-          lb = lax.max(lb, lax.div(k_start_min, block_kv))
+          lb = lax.max(lb, mgpu_lib.udiv(lax.max(k_start_min, 0), block_kv))
 
         if k_end_minmax_gmems is None:
           k_end_min = None
         else:
           k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_gmems)
-          ub = lax.min(ub, pl.cdiv(k_end_max, block_kv))
+          ub = lax.min(ub, mgpu_lib.ucdiv(lax.max(k_end_max, 0), block_kv))
 
         return lb, ub, k_start_max, k_end_min
 
@@ -334,7 +346,7 @@ def flash_attention_kernel(
         def prologue():
           @pl.when(wg == 0)
           def load_q():
-            qs = block.ds(qi, 2 * block_q)
+            qs = pl.ds(qi * (2 * block_q), 2 * block_q)
             plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_produced)
 
           for si in range(num_stages):
@@ -357,7 +369,7 @@ def flash_attention_kernel(
         def await_k():
           @pl.when(ub > lb)
           def _():
-            si = lax.rem(prev_iters, num_stages)
+            si = mgpu_lib.urem(prev_iters, num_stages)
             plgpu.barrier_wait(k_bias_produced.at[si])
 
         # If there is a k-range, we expect the first `k` load to be slower than
@@ -370,29 +382,42 @@ def flash_attention_kernel(
             lambda: (await_k(), plgpu.barrier_wait(q_produced)),
         )
 
-        pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
+        if early_q_consumed:
+          schedule_barrier_pred = (wg == 1) | (loop_info.local_index > 0)
+          schedule_barrier_arrive_and_wait(predicate=schedule_barrier_pred)
+          mgpu_lib.bar_arrive(
+              q_consumed_barrier, num_threads=288, predicate=ub <= lb
+          )
+        else:
+          schedule_barrier_arrive_and_wait(predicate=wg == 1)
 
         def kv_loop(ki, carry, *, do_causal=False):
           acc, m_scale, m_i, l_i = carry
-          si = lax.rem(prev_iters + ki - lb, num_stages)
+          si = mgpu_lib.urem(prev_iters + ki - lb, num_stages)
           k_base = ki * block_kv
           ks = cast(pl.Slice, pl.ds(k_base, block_kv))
 
           def compute_qk(acc):
-            plgpu.wgmma(acc, q_smem.at[block.ds(wg, block_q)], k_smem.at[si].T)
+            plgpu.wgmma(
+                acc, q_smem.at[pl.ds(wg * block_q, block_q)], k_smem.at[si].T
+            )
             schedule_barrier_arrive()
             if bias_gmem is None:
               bias = None
             elif bias_smem is None:
               bias = _load_bcast(bias_gmem, (hi, qs, ks), layout=_WGMMA)
             else:
-              bias = bias_smem[si, block.ds(wg, block_q)]
+              bias = bias_smem[si, pl.ds(wg * block_q, block_q)]
             mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
             return acc[...], bias, mask
 
           acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
           s, bias, mask = pl.run_scoped(compute_qk, acc_type)
           mgpu_lib.bar_arrive(k_consumed_barrier + si, num_threads=288)
+          if early_q_consumed:
+            mgpu_lib.bar_arrive(
+                q_consumed_barrier, num_threads=288, predicate=ki == ub - 1
+            )
 
           scale = logits_scale
 
@@ -431,13 +456,20 @@ def flash_attention_kernel(
                 mask = plgpu.load(mask_smem.at[si], layout=_WGMMA_COL)
                 mask = lax.broadcast_in_dim(mask, s.shape, [1])
               else:
-                mask = mask_smem[si, block.ds(wg, block_q)]
+                mask = mask_smem[si, pl.ds(wg * block_q, block_q)]
               mgpu_lib.bar_arrive(mask_consumed_barrier + si, num_threads=288)
             s = jnp.where(mask, s, -jnp.inf)
 
           scale *= math.log2(math.e)
           if use_stable_softmax:
-            m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
+            if jax.__version_info__ >= (0, 12, 0):
+              max_ilp = block_q // 16
+              if block_q * block_kv <= 4096 and bias_gmem is None:
+                max_ilp *= 2
+              s_max = plgpu.max(s, axis=1, accumulator_ilp=max_ilp)
+            else:
+              s_max = s.max(axis=1)
+            m_i = jnp.maximum(m_i, s_max * scale)
             m_valid = (mask is None and not has_k_range) | (m_i != -jnp.inf)
             alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
             threshold_is_1 = rescale_threshold == 1.0
@@ -452,10 +484,15 @@ def flash_attention_kernel(
             p = jnp.exp2(s * scale)
           p_ = p.astype(v.dtype)
 
+          def p_sum():
+            if jax.__version_info__ >= (0, 12, 0):
+              return plgpu.sum(p, axis=1, accumulator_ilp=(block_q // 16) * 2)
+            return p.sum(axis=1)
+
           # Can't fully explain why, but empirically the ordering here
           # influences the performance of the final kernel quite significantly.
           if p_sum_before_barriers := (head_dim <= 128):
-            l_i += p.sum(axis=1)
+            l_i += p_sum()
             acc, p_ = lax.optimization_barrier((acc, p_))
             l_i, m_i, m_scale = lax.optimization_barrier((l_i, m_i, m_scale))
 
@@ -467,11 +504,11 @@ def flash_attention_kernel(
             plgpu.wgmma(acc, p_, v_smem.at[si])
 
             if not p_sum_before_barriers:
-              l_i[...] += p.sum(axis=1)
+              l_i[...] += p_sum()
 
             @pl.when(ki + 1 < ub)
             def _():
-              si_next = lax.rem(prev_iters + ki + 1 - lb, num_stages)
+              si_next = mgpu_lib.urem(prev_iters + ki + 1 - lb, num_stages)
               plgpu.barrier_wait(k_bias_produced.at[si_next])
 
           acc, l_i = pl.run_state(compute_pv)((plgpu.ACC.init(acc), l_i))
@@ -482,7 +519,7 @@ def flash_attention_kernel(
 
         if is_causal:
           causal_loop_body = functools.partial(kv_loop, do_causal=True)
-          ub_no_causal = lax.min(ub, lax.div(q_base, block_kv))
+          ub_no_causal = lax.min(ub, mgpu_lib.udiv(q_base, block_kv))
           carry = lax.fori_loop(lb, ub_no_causal, kv_loop, carry)
           # TODO: This cond should be redundant, but without it we
           # hit a weird compiler bug.
@@ -494,14 +531,18 @@ def flash_attention_kernel(
         else:
           acc, m_scale, m_i, l_i = lax.fori_loop(lb, ub, kv_loop, carry)
 
-        @pl.when(wg == 0)
-        def unblock_wg1_and_q_load():
-          if config.persistent:
-            # We must sync here to ensure that WG1 is finished with `q_smem`.
-            mgpu_lib.bar_sync(schedule_barrier + 1, num_threads=256)
-            mgpu_lib.bar_arrive(q_consumed_barrier, num_threads=160)
-          else:
-            schedule_barrier_arrive()
+        if early_q_consumed:
+          schedule_barrier_arrive()
+        elif config.persistent:
+          # We must sync here to ensure that WG1 is finished with `q_smem`.
+          mgpu_lib.bar_sync(
+              schedule_barrier + 1, num_threads=256, predicate=wg == 0
+          )
+          mgpu_lib.bar_arrive(
+              q_consumed_barrier, num_threads=160, predicate=wg == 0
+          )
+        else:
+          schedule_barrier_arrive(predicate=wg == 0)
 
         m_valid = (mask is None and not has_k_range) | (m_i != -jnp.inf)
         alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
@@ -532,7 +573,9 @@ def flash_attention_kernel(
         o_gmem_ = o_gmem.at[qs, hi]
         for qj in range(block_q // epi_tile_q):
           for dj in range(head_dim_out // epi_tile_d):
-            si = lax.rem(qj * (head_dim_out // epi_tile_d) + dj, num_epi_slots)
+            si = mgpu_lib.urem(
+                qj * (head_dim_out // epi_tile_d) + dj, num_epi_slots
+            )
             epi_qs = slice(qj * epi_tile_q, (qj + 1) * epi_tile_q)
             epi_ds = slice(dj * epi_tile_d, (dj + 1) * epi_tile_d)
             plgpu.wait_smem_to_gmem(num_epi_slots - 1, wait_read_only=True)
@@ -546,8 +589,8 @@ def flash_attention_kernel(
 
       def memory_wg():
         plgpu.set_max_registers(40, action="decrease")
-        hi_kv = lax.div(hi, q_heads_per_kv_head)
-        qs = block.ds(qi, 2 * block_q)
+        hi_kv = mgpu_lib.udiv(hi, q_heads_per_kv_head)
+        qs = pl.ds(qi * (2 * block_q), 2 * block_q)
 
         if bias_smem is None:
           bias_gmem_ = None
@@ -575,8 +618,8 @@ def flash_attention_kernel(
 
             @pl.loop(lb, ub)
             def kv_loop(ki):
-              si = lax.rem(prev_iters + ki - lb, num_stages)
-              ks = block.ds(ki, block_kv)
+              si = mgpu_lib.urem(prev_iters + ki - lb, num_stages)
+              ks = pl.ds(ki * block_kv, block_kv)
               mgpu_lib.bar_sync(k_consumed_barrier + si, num_threads=288)
               cp(k_gmem.at[ks, hi_kv], k_smem, k_bias_produced, si)
               if bias_gmem_ is not None:
@@ -596,7 +639,8 @@ def flash_attention_kernel(
             @pl.when((warp_id == 1) & (loop_info.local_index > 0))
             def tma_q_load_warp():
               plgpu.async_prefetch(q_gmem.at[qs, hi])
-              mgpu_lib.bar_sync(q_consumed_barrier, num_threads=160)
+              num_threads = 288 if early_q_consumed else 160
+              mgpu_lib.bar_sync(q_consumed_barrier, num_threads=num_threads)
               plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_produced)
 
         return lb, ub
@@ -606,21 +650,8 @@ def flash_attention_kernel(
 
   # Pre-reduce the k_start/k_end to a single value per `2 * block_q` (as compute
   # warpgroups share the same k/v blocks).
-  if k_start is None:
-    k_start_minmax = None
-  elif k_start.shape[-1] == 1:
-    k_start_minmax = (k_start, k_start)
-  else:
-    k_start_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_start)
-    k_start_minmax = (jnp.min(k_start_, -1), jnp.max(k_start_, -1))
-
-  if k_end is None:
-    k_end_minmax = None
-  elif k_end.shape[-1] == 1:
-    k_end_minmax = (k_end, k_end)
-  else:
-    k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end)
-    k_end_minmax = (jnp.min(k_end_, -1), jnp.max(k_end_, -1))
+  k_start_minmax = common.k_range_block_minmax(k_start, kv_seq_len, 2 * block_q)
+  k_end_minmax = common.k_range_block_minmax(k_end, kv_seq_len, 2 * block_q)
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:
@@ -634,22 +665,14 @@ def flash_attention_kernel(
   if config.persistent:
     maybe_persistent_kernel = mgpu_lib.static_scheduling_persistent_kernel
   else:
-    grid_names = ("heads", "q_tiles")
-
-    def maybe_persistent_kernel(body, **kwargs):
-      def wrapped_body(*args, **kwargs):
-        idx = tuple(map(lax.axis_index, grid_names))
-        loop_info = plgpu.NDLoopInfo(idx, local_index=0, num_local_steps=1)
-        grid_loop = lambda init_carry: lambda f: f(args, loop_info, init_carry)
-        return body(grid_loop, **kwargs)
-
-      return plgpu.kernel(wrapped_body, grid_names=grid_names, **kwargs)
+    maybe_persistent_kernel = mgpu_lib.not_persistent_grid_loop_kernel
 
   out, *residuals = maybe_persistent_kernel(
       kernel,
       out_type=out_shape,
       scratch_types=scratch_types,
       grid=(num_q_heads, num_q_tiles),
+      grid_names=("heads", "q_tiles"),
       num_threads=_COMPUTE_WGS + 1,
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(
@@ -660,5 +683,6 @@ def flash_attention_kernel(
       kernel_name="flash_attention_sm90",
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
-  residuals = tuple(res[..., :q_seq_len] for res in residuals)
+  out = out[:orig_q_seq_len, ...]
+  residuals = tuple(res[..., :orig_q_seq_len] for res in residuals)
   return (out[..., :orig_head_dim_out], residuals if residuals else None)

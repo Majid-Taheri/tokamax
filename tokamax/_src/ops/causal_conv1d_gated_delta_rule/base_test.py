@@ -17,436 +17,51 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-import numpy as np
-from tokamax._src import mosaic_tpu
-from tokamax._src.ops.causal_conv1d_gated_delta_rule import base
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import compute_gdn
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import reference
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import test_base
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import wrapper
 
 
-class GDNAttentionTest(parameterized.TestCase):
+def _fused_conv1d_gdn_tuple(*, conv_state, recurrent_state, **kwargs):
+  return wrapper.fused_conv1d_gdn(
+      states=(conv_state, recurrent_state),
+      **kwargs,
+  )
+
+
+class GDNAttentionTest(test_base.CausalConv1dGatedDeltaRuleTestBase):
+
+  def __init__(self, *args):
+    # `wrapper.fused_conv1d_gdn` disables buffer donation.
+    super().__init__(*args, gdn_fn=_fused_conv1d_gdn_tuple)
+
+
+class GDNSecurityTest(test_base.CausalConv1dGatedDeltaRuleSecurityTestBase):
+
+  def __init__(self, *args):
+    super().__init__(*args, gdn_fn=_fused_conv1d_gdn_tuple)
+
+
+class GDNReferenceL2NormTest(parameterized.TestCase):
+  """Tests for the GDN l2norm helpers.
+
+  These are implementation-independent, so they live here rather than in the
+  shared suite in `test_base.py`.
+  """
 
   def setUp(self):
     super().setUp()
-    if jax.default_backend() != "tpu":
-      self.skipTest("Only supported on TPUs.")
-    try:
-      if not pltpu.get_tpu_info().generation >= 6:
-        self.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
-    except Exception:
-      self.skipTest("Failed to get TPU info.")
-
-  @parameterized.named_parameters(
-      dict(
-          testcase_name="prefill",
-          max_reqs=1,
-          lengths=[8192],
-          q_loc=[0, 8192],
-          distribution=[0, 0, 3],
-      ),
-      dict(
-          testcase_name="mixed",
-          max_reqs=3,
-          lengths=[256, 128, 128],
-          q_loc=[0, 256, 384, 512],
-          distribution=[0, 3, 3],
-      ),
-      dict(
-          testcase_name="decode_only",
-          max_reqs=64,
-          lengths=[1] * 64,
-          q_loc=list(range(65)),
-          distribution=[64, 64, 64],
-      ),
-      dict(
-          testcase_name="mixed_prefill_decode",
-          max_reqs=11,
-          lengths=[1] * 8 + [128, 128, 256],
-          q_loc=[0, 1, 2, 3, 4, 5, 6, 7, 8, 136, 264, 520],
-          distribution=[8, 11, 11],
-      ),
-      dict(
-          testcase_name="padded_mixed_prefill",
-          max_reqs=16,
-          lengths=[128, 64, 32, 16, 8],
-          q_loc=[0, 128, 192, 224, 240, 248] + [1] * 11,
-          distribution=[0, 5, 5],
-      ),
-      dict(
-          testcase_name="padded_decode_only",
-          max_reqs=512,
-          lengths=[1] * 64,
-          q_loc=list(range(65)) + [1] * 448,
-          distribution=[64, 64, 64],
-      ),
-      dict(
-          testcase_name="prefill_fused",
-          max_reqs=1,
-          lengths=[8192],
-          q_loc=[0, 8192],
-          distribution=[0, 0, 3],
-      ),
-      dict(
-          testcase_name="mixed_fused",
-          max_reqs=3,
-          lengths=[256, 128, 128],
-          q_loc=[0, 256, 384, 512],
-          distribution=[0, 3, 3],
-      ),
-  )
-  def test_run_jax_gdn_attention_local(
-      self, max_reqs, lengths, q_loc, distribution
-  ):
-    kq_head_dim = 128
-    v_head_dim = 128
-    n_kq = 2
-    n_v = 8
-    kernel_size = 4
-
-    num_tokens = sum(lengths)
-
-    q_loc = jnp.array(q_loc)
-    distribution = jnp.array(distribution, dtype=jnp.int32)
-
-    # recurrent_state[0] and conv_state[0] are reserved for null blocks
-    # (invalid / padded tokens). so start with index 1
-    state_indices = jnp.arange(1, max_reqs + 1)
-    num_blocks = max_reqs + 1
-
-    rngs = iter(jax.random.split(jax.random.key(0), 12))
-
-    query = jax.random.normal(next(rngs), (num_tokens, n_kq * kq_head_dim))
-    key = jax.random.normal(next(rngs), (num_tokens, n_kq * kq_head_dim))
-    value = jax.random.normal(next(rngs), (num_tokens, n_v * v_head_dim))
-    b = jax.random.normal(next(rngs), (num_tokens, n_v))
-    a = jax.random.normal(next(rngs), (num_tokens, n_v))
-
-    conv_state_q = jnp.zeros((num_blocks, kernel_size - 1, n_kq * kq_head_dim))
-    conv_state_k = jnp.zeros((num_blocks, kernel_size - 1, n_kq * kq_head_dim))
-    conv_state_v = jnp.zeros((num_blocks, kernel_size - 1, n_v * v_head_dim))
-    recurrent_state = jnp.zeros((num_blocks, n_v, kq_head_dim, v_head_dim))
-
-    conv_weight_q = jax.random.normal(
-        next(rngs), (n_kq * kq_head_dim, 1, kernel_size)
-    )
-    conv_weight_k = jax.random.normal(
-        next(rngs), (n_kq * kq_head_dim, 1, kernel_size)
-    )
-    conv_weight_v = jax.random.normal(
-        next(rngs), (n_v * v_head_dim, 1, kernel_size)
-    )
-
-    conv_bias_q = jax.random.normal(next(rngs), (n_kq * kq_head_dim,))
-    conv_bias_k = jax.random.normal(next(rngs), (n_kq * kq_head_dim,))
-    conv_bias_v = jax.random.normal(next(rngs), (n_v * v_head_dim,))
-
-    A_log = jax.random.normal(next(rngs), (n_v,))
-    dt_bias = jax.random.normal(jax.random.key(0), (n_v,))
-
-    mixed_qkv = jnp.concatenate([query, key, value], axis=-1)
-    conv_state = jnp.concatenate(
-        [conv_state_q, conv_state_k, conv_state_v], axis=-1
-    )
-    conv_weight = jnp.concatenate(
-        [conv_weight_q, conv_weight_k, conv_weight_v], axis=0
-    )
-    conv_bias = jnp.concatenate(
-        [conv_bias_q, conv_bias_k, conv_bias_v], axis=-1
-    )
-
-    # Create wrapper that disables buffer donation.
-    run_jax_gdn_attention_local_jitted = jax.jit(
-        wrapper.fused_conv1d_gdn,
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
-    )
-    run_jax_gdn_attention_base_op_jitted = jax.jit(
-        base.CausalConv1dGatedDeltaRule(),
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size", "config"],
-    )
-
-    # All sequences in this test start from a fresh slot; the existing
-    # parametrizations don't exercise prefix-cache-hit / chunked-prefill
-    # continuation. ``seq_lens == query_lens`` (context_len = 0)
-    # reproduces the prior behavior (zero initial state regardless of
-    # slot contents).
-    seq_lens = jnp.asarray(
-        q_loc[1 : max_reqs + 1] - q_loc[:max_reqs], dtype=jnp.int32
-    )
-
-    common_kwargs = dict(
-        qkv=mixed_qkv,
-        b=b,
-        a=a,
-        conv_state=conv_state,
-        recurrent_state=recurrent_state,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        a_log=A_log,
-        dt_bias=dt_bias,
-        query_start_loc=q_loc,
-        state_indices=state_indices,
-        distribution=distribution,
-        seq_lens=seq_lens,
-        n_kq=n_kq,
-        n_v=n_v,
-        d_k=kq_head_dim,
-        d_v=v_head_dim,
-        kernel_size=kernel_size,
-    )
-
-    # Run ref via base op
-    new_states_ref, output_ref = run_jax_gdn_attention_base_op_jitted(
-        **common_kwargs
-    )
-
-    # Run chunked
-    new_states_chunked, output_chunked = run_jax_gdn_attention_local_jitted(
-        **common_kwargs
-    )
-
-    # Compare results
-    np.testing.assert_allclose(output_chunked, output_ref, rtol=2e-2, atol=2e-2)
-    np.testing.assert_allclose(
-        new_states_chunked[0], new_states_ref[0], rtol=2e-2, atol=2e-2
-    )
-    np.testing.assert_allclose(
-        new_states_chunked[1], new_states_ref[1], rtol=2e-2, atol=2e-2
-    )
-
-  def test_has_initial_state_zeros_stale_slot(self):
-    """A new prefill landing on a slot whose previous tenant left
-
-    non-zero state must produce the same output and final state as it
-    would on a fresh-zero slot.
-    """
-    kq_head_dim = 128
-    v_head_dim = 128
-    n_kq = 2
-    n_v = 8
-    kernel_size = 4
-
-    # Two requests, one prefill of 64 tokens each.
-    max_reqs = 2
-    lengths = [64, 64]
-    q_loc = jnp.array([0, 64, 128])
-    distribution = jnp.array([0, 2, 2], dtype=jnp.int32)
-    num_tokens = sum(lengths)
-
-    state_indices = jnp.arange(1, max_reqs + 1)
-    num_blocks = max_reqs + 1
-
-    rngs = iter(jax.random.split(jax.random.key(7), 12))
-    query = jax.random.normal(next(rngs), (num_tokens, n_kq * kq_head_dim))
-    key = jax.random.normal(next(rngs), (num_tokens, n_kq * kq_head_dim))
-    value = jax.random.normal(next(rngs), (num_tokens, n_v * v_head_dim))
-    b = jax.random.normal(next(rngs), (num_tokens, n_v))
-    a = jax.random.normal(next(rngs), (num_tokens, n_v))
-
-    conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
-    conv_state_fresh = jnp.zeros((num_blocks, kernel_size - 1, conv_dim))
-    recurrent_state_fresh = jnp.zeros(
-        (num_blocks, n_v, kq_head_dim, v_head_dim)
-    )
-
-    # Build a "stale" pair where the slots that the two new requests
-    # land on are filled with arbitrary nonzero values.
-    stale_conv = jax.random.normal(
-        next(rngs), (num_blocks, kernel_size - 1, conv_dim)
-    )
-    stale_recurrent = jax.random.normal(
-        next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim)
-    )
-    # Slot 0 is the null block; leave it zero.
-    conv_state_stale = conv_state_fresh.at[1:].set(stale_conv[1:])
-    recurrent_state_stale = recurrent_state_fresh.at[1:].set(
-        stale_recurrent[1:]
-    )
-
-    conv_weight = jax.random.normal(next(rngs), (conv_dim, 1, kernel_size))
-    conv_bias = jax.random.normal(next(rngs), (conv_dim,))
-    A_log = jax.random.normal(next(rngs), (n_v,))
-    dt_bias = jax.random.normal(next(rngs), (n_v,))
-
-    mixed_qkv = jnp.concatenate([query, key, value], axis=-1)
-
-    # Create wrapper that disables buffer donation.
-    run_jitted = jax.jit(
-        wrapper.fused_conv1d_gdn,
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
-    )
-
-    # Both requests are brand new — no prior context. seq_lens equals
-    # query_lens so context_len = 0 → has_initial_state = False.
-    seq_lens_new = jnp.asarray(lengths, dtype=jnp.int32)
-
-    common_kwargs = dict(
-        qkv=mixed_qkv,
-        b=b,
-        a=a,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        a_log=A_log,
-        dt_bias=dt_bias,
-        query_start_loc=q_loc,
-        state_indices=state_indices,
-        distribution=distribution,
-        seq_lens=seq_lens_new,
-        n_kq=n_kq,
-        n_v=n_v,
-        d_k=kq_head_dim,
-        d_v=v_head_dim,
-        kernel_size=kernel_size,
-    )
-
-    # Reference run: fresh-zero slots.
-    (new_conv_fresh, new_rec_fresh), output_fresh = run_jitted(
-        conv_state=conv_state_fresh,
-        recurrent_state=recurrent_state_fresh,
-        **common_kwargs,
-    )
-    # Stale-slot run: same inputs, but the slots already contain a
-    # prior request's state. With the fix, has_initial_state=False
-    # masks that out — outputs and the writeback at the active slots
-    # must match the fresh-zero run.
-    (new_conv_stale, new_rec_stale), output_stale = run_jitted(
-        conv_state=conv_state_stale,
-        recurrent_state=recurrent_state_stale,
-        **common_kwargs,
-    )
-
-    np.testing.assert_allclose(output_fresh, output_stale, rtol=1e-5, atol=1e-5)
-    # Compare the active slots (1..max_reqs+1); slot 0 (null) is
-    # untouched in both runs and inactive slots are unused.
-    np.testing.assert_allclose(
-        new_conv_fresh[1 : max_reqs + 1],
-        new_conv_stale[1 : max_reqs + 1],
-        rtol=1e-5,
-        atol=1e-5,
-    )
-    np.testing.assert_allclose(
-        new_rec_fresh[1 : max_reqs + 1],
-        new_rec_stale[1 : max_reqs + 1],
-        rtol=1e-5,
-        atol=1e-5,
-    )
-
-  def test_has_initial_state_preserves_continuation(self):
-    """When ``has_initial_state[i]`` is True, the kernel must use the
-
-    slot's existing state as the prefill's initial state.
-    """
-    kq_head_dim = 128
-    v_head_dim = 128
-    n_kq = 2
-    n_v = 8
-    kernel_size = 4
-
-    # One request, prefill split into two halves of 32 tokens each.
-    half = 32
-    full = 64
-    state_indices = jnp.array([1])
-    num_blocks = 2
-
-    rngs = iter(jax.random.split(jax.random.key(11), 12))
-    query = jax.random.normal(next(rngs), (full, n_kq * kq_head_dim))
-    key = jax.random.normal(next(rngs), (full, n_kq * kq_head_dim))
-    value = jax.random.normal(next(rngs), (full, n_v * v_head_dim))
-    b = jax.random.normal(next(rngs), (full, n_v))
-    a = jax.random.normal(next(rngs), (full, n_v))
-
-    conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
-    conv_weight = jax.random.normal(next(rngs), (conv_dim, 1, kernel_size))
-    conv_bias = jax.random.normal(next(rngs), (conv_dim,))
-    A_log = jax.random.normal(next(rngs), (n_v,))
-    dt_bias = jax.random.normal(next(rngs), (n_v,))
-
-    mixed_qkv_full = jnp.concatenate([query, key, value], axis=-1)
-    mixed_qkv_a = mixed_qkv_full[:half]
-    mixed_qkv_b = mixed_qkv_full[half:]
-
-    conv_state_zero = jnp.zeros((num_blocks, kernel_size - 1, conv_dim))
-    recurrent_state_zero = jnp.zeros((num_blocks, n_v, kq_head_dim, v_head_dim))
-
-    # Create wrapper that disables buffer donation.
-    run_jitted = jax.jit(
-        wrapper.fused_conv1d_gdn,
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
-    )
-    common_static = dict(
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        a_log=A_log,
-        dt_bias=dt_bias,
-        state_indices=state_indices,
-        n_kq=n_kq,
-        n_v=n_v,
-        d_k=kq_head_dim,
-        d_v=v_head_dim,
-        kernel_size=kernel_size,
-    )
-
-    # Single-shot reference (all 64 tokens, zero state, has_initial=False
-    # encoded as seq_lens == query_lens == [full]).
-    (_, _), output_ref = run_jitted(
-        qkv=mixed_qkv_full,
-        b=b,
-        a=a,
-        conv_state=conv_state_zero,
-        recurrent_state=recurrent_state_zero,
-        query_start_loc=jnp.array([0, full]),
-        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
-        seq_lens=jnp.array([full], dtype=jnp.int32),
-        **common_static,
-    )
-
-    # Step A: first 32 tokens, zero state, has_initial=False.
-    (conv_after_a, rec_after_a), output_a = run_jitted(
-        qkv=mixed_qkv_a,
-        b=b[:half],
-        a=a[:half],
-        conv_state=conv_state_zero,
-        recurrent_state=recurrent_state_zero,
-        query_start_loc=jnp.array([0, half]),
-        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
-        seq_lens=jnp.array([half], dtype=jnp.int32),
-        **common_static,
-    )
-
-    # Step B: next 32 tokens, slot now holds Step A's state.
-    # seq_lens=[full] with query_lens=[half] gives context_len=half>0,
-    # i.e., has_initial=True so the kernel continues from that state.
-    (_, _), output_b = wrapper.fused_conv1d_gdn(
-        qkv=mixed_qkv_b,
-        b=b[half:],
-        a=a[half:],
-        conv_state=conv_after_a,
-        recurrent_state=rec_after_a,
-        query_start_loc=jnp.array([0, half]),
-        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
-        seq_lens=jnp.array([full], dtype=jnp.int32),
-        **common_static,
-    )
-
-    # Step A's output must match the first half of the single-shot
-    # reference; Step B (continuation) must match the second half.
-    np.testing.assert_allclose(
-        output_a, output_ref[:half], rtol=2e-2, atol=2e-2
-    )
-    np.testing.assert_allclose(
-        output_b, output_ref[half:], rtol=2e-2, atol=2e-2
-    )
+    test_base.skip_if_unsupported(self)
 
   @parameterized.named_parameters(
       dict(testcase_name="chunked", l2norm_fn=reference.l2norm_chunked),
       dict(testcase_name="ref", l2norm_fn=reference.l2_normalize_ref),
+      dict(testcase_name="compute_gdn", l2norm_fn=compute_gdn.l2_norm),
   )
   def test_l2norm_fp32_internal_more_precise_than_bf16(self, l2norm_fn):
-    """The l2norm helper must do its sum-of-squares in fp32 even when
-
-    the input is bf16.
-    """
+    """The l2norm helper must accumulate in fp32 even for bf16 input."""
     rng = jax.random.key(13)
     x_f32 = jax.random.normal(rng, (32, 256)) * 5.0
     x_bf16 = x_f32.astype(jnp.bfloat16)
@@ -477,12 +92,10 @@ class GDNAttentionTest(parameterized.TestCase):
   @parameterized.named_parameters(
       dict(testcase_name="chunked", l2norm_fn=reference.l2norm_chunked),
       dict(testcase_name="ref", l2norm_fn=reference.l2_normalize_ref),
+      dict(testcase_name="compute_gdn", l2norm_fn=compute_gdn.l2_norm),
   )
   def test_l2norm_returns_input_dtype(self, l2norm_fn):
-    """The l2norm helpers compute in fp32 internally but must return
-
-    the input dtype unchanged.
-    """
+    """The l2norm helpers must return the input dtype unchanged."""
     x = jax.random.normal(jax.random.key(17), (4, 128)).astype(jnp.bfloat16)
     if l2norm_fn is reference.l2norm_chunked:
       out = l2norm_fn(x, dim=-1)
@@ -490,106 +103,89 @@ class GDNAttentionTest(parameterized.TestCase):
       out = l2norm_fn(x)
     self.assertEqual(out.dtype, jnp.bfloat16)
 
+  def test_recurrent_step_fp32_internal_more_precise_than_bf16(self):
+    """Recurrent step contractions must use fp32 precision rather than bf16."""
+    k0, k1, k2, k3, k4, k5 = jax.random.split(jax.random.key(29), 6)
+    shape_qk = (2, 4, 1, 128)
+    shape_v = (2, 4, 1, 128)
+    shape_bg = (2, 4, 1)
+    shape_state = (2, 4, 128, 128)
 
-class GDNSecurityTest(absltest.TestCase):
+    q = jax.random.normal(k0, shape_qk, dtype=jnp.float32)
+    k = jax.random.normal(k1, shape_qk, dtype=jnp.float32)
+    v = jax.random.normal(k2, shape_v, dtype=jnp.float32)
+    g = -jnp.abs(jax.random.normal(k3, shape_bg, dtype=jnp.float32)) * 0.1
+    beta = jax.nn.sigmoid(jax.random.normal(k4, shape_bg, dtype=jnp.float32))
+    state = jax.random.normal(k5, shape_state, dtype=jnp.float32)
 
-  def setUp(self):
-    super().setUp()
-    if jax.default_backend() != "tpu":
-      self.skipTest("Only supported on TPUs.")
-    try:
-      if not pltpu.get_tpu_info().generation >= 6:
-        self.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
-    except Exception:
-      self.skipTest("Failed to get TPU info.")
-
-  def test_uninitialized_memory_robustness(self):
-    mosaic_tpu.poison_tpu_memory()
-    seq_lens = jnp.array([128], dtype=jnp.int32)
-    mixed_qkv = jnp.zeros((128, 1536), dtype=jnp.float32)
-    new_states, output = wrapper.fused_conv1d_gdn(
-        qkv=mixed_qkv,
-        seq_lens=seq_lens,
-        b=jnp.zeros((128, 8), dtype=jnp.float32),
-        a=jnp.zeros((128, 8), dtype=jnp.float32),
-        conv_state=jnp.zeros((2, 3, 1536), dtype=jnp.float32),
-        recurrent_state=jnp.zeros((2, 8, 128, 128), dtype=jnp.float32),
-        conv_weight=jnp.zeros((1536, 1, 4), dtype=jnp.float32),
-        conv_bias=jnp.zeros((1536,), dtype=jnp.float32),
-        a_log=jnp.zeros((8,), dtype=jnp.float32),
-        dt_bias=jnp.zeros((8,), dtype=jnp.float32),
-        query_start_loc=jnp.array([0, 128]),
-        state_indices=jnp.array([1]),
-        distribution=jnp.array([0, 3, 3], dtype=jnp.int32),
-        n_kq=2,
-        n_v=8,
-        d_k=128,
-        d_v=128,
-        kernel_size=4,
-    )
-    for new_state in new_states:
-      self.assertFalse(jnp.any(jnp.isnan(new_state)))
-    self.assertFalse(jnp.any(jnp.isnan(output)))
-
-  def test_security_isolation(self):
-    # Configure two request sequences sharing the same local layer runner
-    seq_lens = jnp.array([128, 128], dtype=jnp.int32)
-    mixed_qkv = jnp.zeros((256, 1536), dtype=jnp.float32)
-
-    # Baseline clean context evaluation
-    _, output_clean = wrapper.fused_conv1d_gdn(
-        qkv=mixed_qkv,
-        seq_lens=seq_lens,
-        b=jnp.zeros((256, 8), dtype=jnp.float32),
-        a=jnp.zeros((256, 8), dtype=jnp.float32),
-        conv_state=jnp.zeros((3, 3, 1536), dtype=jnp.float32),
-        recurrent_state=jnp.zeros((3, 8, 128, 128), dtype=jnp.float32),
-        conv_weight=jnp.zeros((1536, 1, 4), dtype=jnp.float32),
-        conv_bias=jnp.zeros((1536,), dtype=jnp.float32),
-        a_log=jnp.zeros((8,), dtype=jnp.float32),
-        dt_bias=jnp.zeros((8,), dtype=jnp.float32),
-        query_start_loc=jnp.array([0, 128, 256]),
-        state_indices=jnp.array([1, 2]),
-        distribution=jnp.array([0, 3, 3], dtype=jnp.int32),
-        n_kq=2,
-        n_v=8,
-        d_k=128,
-        d_v=128,
-        kernel_size=4,
+    test_out, test_state = reference._recurrent_gated_delta_rule_step(
+        q, k, v, g, beta, state=state
     )
 
-    # Inject NaNs into the second request's allocated recurrent state buffer
-    recurrent_state_malicious = (
-        jnp.zeros((3, 8, 128, 128), dtype=jnp.float32).at[2].set(jnp.nan)
-    )
-    _, output_malicious = wrapper.fused_conv1d_gdn(
-        qkv=mixed_qkv,
-        seq_lens=seq_lens,
-        b=jnp.zeros((256, 8), dtype=jnp.float32),
-        a=jnp.zeros((256, 8), dtype=jnp.float32),
-        conv_state=jnp.zeros((3, 3, 1536), dtype=jnp.float32),
-        recurrent_state=recurrent_state_malicious,
-        conv_weight=jnp.zeros((1536, 1, 4), dtype=jnp.float32),
-        conv_bias=jnp.zeros((1536,), dtype=jnp.float32),
-        a_log=jnp.zeros((8,), dtype=jnp.float32),
-        dt_bias=jnp.zeros((8,), dtype=jnp.float32),
-        query_start_loc=jnp.array([0, 128, 256]),
-        state_indices=jnp.array([1, 2]),
-        distribution=jnp.array([0, 3, 3], dtype=jnp.int32),
-        n_kq=2,
-        n_v=8,
-        d_k=128,
-        d_v=128,
-        kernel_size=4,
-    )
+    with jax.enable_x64():
+      q64 = q.astype(jnp.float64)[:, :, 0] * (128**-0.5)
+      k64 = k.astype(jnp.float64)[:, :, 0]
+      v64 = v.astype(jnp.float64)[:, :, 0]
+      g64 = g.astype(jnp.float64)[:, :, 0]
+      beta64 = beta.astype(jnp.float64)[:, :, 0]
+      s64 = state.astype(jnp.float64)
+      k_state64 = jnp.einsum(
+          "bhd, bhdm -> bhm", k64, s64, precision=jax.lax.Precision.HIGHEST
+      )
+      v_new64 = beta64[..., None] * (v64 - jnp.exp(g64)[..., None] * k_state64)
+      q_state64 = jnp.einsum(
+          "bhd, bhdm -> bhm", q64, s64, precision=jax.lax.Precision.HIGHEST
+      )
+      q_k64 = jnp.sum(q64 * k64, axis=-1, keepdims=True)
+      ref_out = (jnp.exp(g64)[..., None] * q_state64 + q_k64 * v_new64)[
+          :, :, None, :
+      ].astype(jnp.float32)
+      ref_state = (
+          s64 * jnp.exp(g64)[..., None, None]
+          + jnp.einsum(
+              "bhd, bhm -> bhdm",
+              k64,
+              v_new64,
+              precision=jax.lax.Precision.HIGHEST,
+          )
+      ).astype(jnp.float32)
 
-    # Assert strict sequence isolation for the first sequence
-    np.testing.assert_allclose(
-        np.array(output_malicious[:128]),
-        np.array(output_clean[:128]),
-        atol=0,
-        rtol=0,
+    q_bf16 = (q[:, :, 0] * (128**-0.5)).astype(jnp.bfloat16)
+    k_bf16 = k[:, :, 0].astype(jnp.bfloat16)
+    s_bf16 = state.astype(jnp.bfloat16)
+    k_state_bf16 = jnp.einsum(
+        "bhd, bhdm -> bhm",
+        k_bf16,
+        s_bf16,
+        preferred_element_type=jnp.float32,
     )
+    v_new_bf16 = beta[:, :, 0, None] * (
+        v[:, :, 0] - jnp.exp(g[:, :, 0])[..., None] * k_state_bf16
+    )
+    q_state_bf16 = jnp.einsum(
+        "bhd, bhdm -> bhm",
+        q_bf16,
+        s_bf16,
+        preferred_element_type=jnp.float32,
+    )
+    q_k_bf16 = jnp.sum(
+        (q[:, :, 0] * (128**-0.5)) * k[:, :, 0], axis=-1, keepdims=True
+    )
+    bf16_out = (
+        jnp.exp(g[:, :, 0])[..., None] * q_state_bf16 + q_k_bf16 * v_new_bf16
+    )[:, :, None, :]
+
+    test_out_err = float(jnp.max(jnp.abs(test_out - ref_out)))
+    bf16_out_err = float(jnp.max(jnp.abs(bf16_out - ref_out)))
+    test_state_err = float(jnp.max(jnp.abs(test_state - ref_state)))
+
+    self.assertLess(
+        test_out_err,
+        bf16_out_err / 10.0,
+        f"fp32 recurrent step out err {test_out_err:.4g} is not at "
+        f"least 10× tighter than bf16 MXU err {bf16_out_err:.4g}",
+    )
+    self.assertLess(test_state_err, 1e-4)
 
 
 if __name__ == "__main__":

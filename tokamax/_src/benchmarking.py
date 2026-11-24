@@ -19,6 +19,7 @@ import contextlib
 import dataclasses
 import datetime
 import inspect
+import json
 import logging
 import os
 import pathlib
@@ -28,6 +29,7 @@ import time
 from typing import Any, Final, Literal, cast, overload
 
 import jax
+from jax.experimental import layout as jax_layout
 from jax.experimental.mosaic.gpu import profiler
 import numpy as np
 from tokamax._src import batching
@@ -95,6 +97,16 @@ class BenchmarkData:
     return ret
 
 
+def _safe_reset_jax_profiler_state() -> None:
+  """Safely resets the internal JAX profiler state if accessible."""
+  # TODO: Remove once JAX provides a public API to reset or query active
+  # profiler sessions.
+  try:
+    jax._src.profiler._profile_state.reset()  # pylint: disable=protected-access
+  except Exception:  # pylint: disable=broad-exception-caught
+    pass
+
+
 class XprofProfileSession(contextlib.AbstractContextManager):
   """XProf context manager for profiling XLA Ops.
 
@@ -137,7 +149,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
 
     self._profile = None
     self._xprof_session = None
-    self._hermetic = hermetic
+    self._hermetic: bool = hermetic
     self.xprof_url: str | None = None
     self._jax_profiler_mode = use_jax_profiler
     if xprof_session is None or profile_data is None:
@@ -157,7 +169,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     if jax.default_backend() == 'tpu':
       options.advanced_configuration = {
           'tpu_trace_mode': 'TRACE_ONLY_XLA',
-          'tpu_perf_counters': True,
+          'tpu_perf_counters': False,
       }
     self._profiler_options = options
 
@@ -219,9 +231,29 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         self._profiler_wallclock_start_time = time.perf_counter()
         self._profiler_wallclock_time = None
 
-        jax.profiler.start_trace(
-            self._profile_tempdir, profiler_options=self._profiler_options
-        )
+        try:
+          jax.profiler.start_trace(
+              self._profile_tempdir, profiler_options=self._profiler_options
+          )
+        except RuntimeError as e:
+          if 'already been started' not in str(e):
+            raise
+          logger.warning(
+              'JAX profiler session is already running; stopping stale trace'
+              ' and retrying.',
+              exc_info=True,
+          )
+          try:
+            jax.profiler.stop_trace()
+          except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                'Failed to stop stale JAX profiler trace.', exc_info=True
+            )
+            _safe_reset_jax_profiler_state()
+          self._profiler_wallclock_start_time = time.perf_counter()
+          jax.profiler.start_trace(
+              self._profile_tempdir, profiler_options=self._profiler_options
+          )
         logger.info('Writing JAX profiler trace to: %s', self._profile_tempdir)
       except Exception as e:
         raise RuntimeError('Unable to start jax profiling session.') from e
@@ -233,10 +265,17 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         # get profiling wallclock time right before the profiling starts
         self._profiler_wallclock_start_time = time.perf_counter()
         self._profiler_wallclock_time = None
-        self._xprof_session.start_session(
+
+        fast_kwargs = dict(
             enable_python_tracer=False,
             host_trace_level=0,
             perf_counters=False,
+        )
+        # If not hermetic, users will generally want as much profiling data in
+        # the resulting XProf session as possible.
+        session_kwargs = fast_kwargs if self._hermetic else {}
+        self._xprof_session.start_session(
+            **session_kwargs,
             **self._xprof_session_kwargs,
         )
       except Exception as e:
@@ -247,7 +286,25 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     del exc_type, exc_tb
 
     if self._jax_profiler_mode:
-      jax.profiler.stop_trace()
+      try:
+        jax.profiler.stop_trace()
+      except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning('Failed to stop JAX profiler trace.', exc_info=True)
+        _safe_reset_jax_profiler_state()
+        if exc_value is None:
+          raise
+
+      if exc_value is not None:
+        if (
+            not self._retain_artifacts
+            or WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ
+        ) and (
+            self._profile_tempdir is not None and self._profile_tempdir.exists()
+        ):
+          shutil.rmtree(self._profile_tempdir, ignore_errors=True)
+        self._profile_tempdir = None
+        return
+
       # get profiling wallclock time right after the profiling ends
       end_time = time.perf_counter()
       assert (start_time := self._profiler_wallclock_start_time) is not None
@@ -300,12 +357,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     trace_matchers = None if (re := self._event_filter_regex) is None else (re,)
 
     try:
-      self._timing_summary = get_kernel_stats_tool.compute_kernel_stats(
-          self._profile,
-          output_format='dict',
-          include_summary=True,
-          trace_matchers=trace_matchers,
+      timing_summary = get_kernel_stats_tool.compute_kernel_stats(
+          self._profile, include_summary=True, trace_matchers=trace_matchers
       )
+      self._timing_summary = json.loads(timing_summary)
     except Exception as e:
       raise RuntimeError(
           f'Could not compute timing summary via xprof_cli for {self._profile}.'
@@ -392,17 +447,16 @@ def standardize_function[T](
     return f(*args, **kwargs)
 
   is_batched = lambda x: isinstance(x, batching.BatchedShapeDtype)
-  if any(map(is_batched, arrays)):
+  if batching.get_vmap_axis_sizes(arrays):
     if not all(map(is_batched, arrays)):
       raise ValueError('Cannot mix batched and non-batched arguments.')
 
-    if batching.get_vmap_axis_sizes(arrays):
-      array_vmap_axes = (
-          (None if axis is None else axis[0] for axis in x.vmap_axes)
-          for x in arrays
-      )
-      for in_axes in reversed(list(zip(*array_vmap_axes, strict=True))):
-        forward = jax.vmap(forward, in_axes=(in_axes,))
+    array_vmap_axes = (
+        (None if axis is None else axis[0] for axis in x.vmap_axes)
+        for x in arrays
+    )
+    for in_axes in reversed(list(zip(*array_vmap_axes, strict=True))):
+      forward = jax.vmap(forward, in_axes=(in_axes,))
 
   if seed is None:
     # `standardize_function` should be idempotent, but the vmaps added to
@@ -508,18 +562,25 @@ def _is_concrete(x):
 
 
 def compile_benchmark[T](
-    f: Callable[[T], Any], x: T
+    f: Callable[[T], Any], x: T, *, auto_input_layouts: bool = False
 ) -> Callable[..., BenchmarkData]:
   """Compiles a function and returns a function to benchmark it.
 
   Args:
     f: A JITable function.
     x: Input to `f`
+    auto_input_layouts: Whether XLA chooses the input layouts, as it does for
+      the parameters of a compiled program. If so, the returned function lays
+      out its input to match before timing. Otherwise the inputs use the
+      default layouts, and any transposes `f` applies to them are timed.
 
   Returns:
     A function to run the benchmark and return a `BenchmarkData` object.
   """
-  f = jax.jit(f)
+  if auto_input_layouts:
+    f = jax.jit(f, in_shardings=jax_layout.Format(jax_layout.Layout.AUTO))
+  else:
+    f = jax.jit(f)
   start_time = time.perf_counter()
   lowered = f.lower(x)
   lowering_time = time.perf_counter() - start_time
@@ -529,6 +590,8 @@ def compile_benchmark[T](
 
   assert (memory_analysis := f_compiled.memory_analysis()) is not None
   peak_mem_mb = memory_analysis.peak_memory_in_bytes / 10**6
+  # `f` takes a single argument, so `input_formats` is `((x_formats,), {})`.
+  input_formats = f_compiled.input_formats[0][0] if auto_input_layouts else None
 
   def runner(
       x: T,
@@ -556,6 +619,8 @@ def compile_benchmark[T](
     Returns:
       A `BenchmarkData` object.
     """
+    if input_formats is not None:
+      x = jax.block_until_ready(jax.device_put(x, input_formats))
     concrete_inputs = [
         z
         for z in jax.tree.leaves(x)

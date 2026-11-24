@@ -14,7 +14,6 @@
 # ==============================================================================
 """Common utilities for Mosaic GPU attention implementations."""
 
-import functools
 from typing import Annotated, Any
 
 import jax
@@ -24,6 +23,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import llvm
+from jaxlib.mlir.dialects import nvvm
 from jaxlib.mlir.dialects import vector
 import numpy as np
 import pydantic
@@ -87,15 +88,25 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
   k_end = None
 
   if k_indices is None:
-    mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
+    is_causal = mask.is_causal
+    mask, causal_mask, k_start, k_end = mask.take(
+        "causal_mask", "k_start", "k_end"
+    )
 
-    # Fold `is_causal` into `k_end`. If `q_indices` is not `None`, then this is
-    # necessary for correctness. Otherwise, it is a performance optimization.
-    if is_causal and (q_indices is not None or k_end is not None):
+    # Fold `causal_mask` into `k_end`. If `q_indices` is not `None`, then this
+    # is necessary for correctness. Otherwise, it is a performance optimization.
+    if causal_mask is not None and (
+        not is_causal or q_indices is not None or k_end is not None
+    ):
       if q_indices is None:
         q_indices = jnp.arange(q.shape[-3])
-      k_end_ = q_indices + 1
+      k_end_ = q_indices + (causal_mask.offset + 1)
       k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
+      if causal_mask.window_size is not None:
+        k_start_ = k_end_ - causal_mask.window_size
+        k_start = (
+            k_start_ if k_start is None else jnp.maximum(k_start, k_start_)
+        )
       is_causal = False
 
     if k_start is not None:
@@ -107,6 +118,24 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
   k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
   mask = mask.as_array(q_len_or_indices, k_len_or_indices)
   return mask, is_causal, k_start, k_end
+
+
+def k_range_block_minmax(
+    k_range: jax.Array | None, kv_seq_len: int, block_q: int
+) -> tuple[jax.Array, jax.Array] | None:
+  """Pre-reduces `k_start` or `k_end` to `(min, max)` per Q-block of `block_q`."""
+  if k_range is None:
+    return None
+  if k_range.shape[-1] == 1:
+    return k_range, k_range
+
+  def pad_reduce(pad_value: int):
+    k_range_ = shape_lib.pad_to_next_multiple_of(
+        k_range, block_q, -1, pad_value
+    )
+    return shape_lib.einshape("...(bq)->...bq", q=block_q)(k_range_)
+
+  return jnp.min(pad_reduce(kv_seq_len), -1), jnp.max(pad_reduce(0), -1)
 
 
 def cast_qkv[
@@ -145,6 +174,34 @@ def _broadcast_to_rank(x, rank):
   return None if x is None else jax.lax.broadcast_to_rank(x, rank)
 
 
+def extract_q_range(
+    mask,
+    q_ndim: int,
+    q_indices,
+    k_indices,
+    *,
+    fold_q_sequence_heads: bool = False,
+):
+  """Extracts key-independent `q_start` and `q_end` from `mask`."""
+  if (
+      mask is None
+      or q_indices is not None
+      or k_indices is not None
+      or fold_q_sequence_heads
+  ):
+    return mask, None, None
+
+  q_start = None
+  q_end = None
+  if mask.q_start is not None and mask.q_start.shape[-1] == 1:
+    mask, q_start = mask.take("q_start")
+    q_start = _broadcast_to_rank(q_start, q_ndim - 1)
+  if mask.q_end is not None and mask.q_end.shape[-1] == 1:
+    mask, q_end = mask.take("q_end")
+    q_end = _broadcast_to_rank(q_end, q_ndim - 1)
+  return mask, q_start, q_end
+
+
 def prepare_inputs(
     q,
     k,
@@ -179,15 +236,36 @@ def prepare_inputs(
 
 
 def eval_input_shapes(
-    ba: op_lib.BoundArguments, *, fold_q_sequence_heads: bool, split_k: int
+    ba: op_lib.BoundArguments,
+    *,
+    fold_q_sequence_heads: bool,
+    split_k: int,
+    extract_q_range_flag: bool = False,
 ):
   """Evaluates the shape of the inputs after `prepare_inputs`."""
-  q, k, v, bias, mask, _, _, _ = jax.eval_shape(
-      functools.partial(
-          prepare_inputs,
-          precision=ba.kwargs["precision"],
+  def _prep(q, k, v, *, bias, mask, q_indices, k_indices):
+    if extract_q_range_flag:
+      mask, _, _ = extract_q_range(
+          mask,
+          q.ndim,
+          q_indices,
+          k_indices,
           fold_q_sequence_heads=fold_q_sequence_heads,
-      ),
+      )
+    return prepare_inputs(
+        q,
+        k,
+        v,
+        bias=bias,
+        mask=mask,
+        q_indices=q_indices,
+        k_indices=k_indices,
+        precision=ba.kwargs["precision"],
+        fold_q_sequence_heads=fold_q_sequence_heads,
+    )
+
+  q, k, v, bias, mask, _, _, _ = jax.eval_shape(
+      _prep,
       *ba.args,
       bias=ba.kwargs["bias"],
       mask=ba.kwargs["mask"],
@@ -242,6 +320,34 @@ def load_bcast(
   return value if layout is None else plgpu.layout_cast(value, layout)
 
 
+MASK_PACK_DTYPE = jnp.int8
+MASK_PACKED_BITS = mgpu_lib.num_bits(MASK_PACK_DTYPE)
+MIN_MASK_COLS = 128 // MASK_PACKED_BITS
+
+
+def pack_mask(mask: jax.Array, block_kv: int | None = None) -> jax.Array:
+  """Packs a boolean mask into bits.
+
+  Args:
+    mask: The boolean mask.
+    block_kv: If given, each block of `block_kv` columns narrower than
+      `MIN_MASK_COLS * MASK_PACKED_BITS` is padded to `MIN_MASK_COLS` bytes so
+      that TMA can load any block. Must be a positive multiple of
+      `MASK_PACKED_BITS`.
+
+  Returns:
+    The packed mask.
+  """
+  mask = jnp.packbits(mask, axis=-1, bitorder="little").view(MASK_PACK_DTYPE)
+  if block_kv is None or block_kv >= MIN_MASK_COLS * MASK_PACKED_BITS:
+    return shape_lib.pad_to_next_multiple_of(mask, m=MIN_MASK_COLS, axis=-1)
+  block_cols = block_kv // MASK_PACKED_BITS
+  mask = shape_lib.pad_to_next_multiple_of(mask, m=block_cols, axis=-1)
+  mask = mask.reshape(*mask.shape[:-1], -1, block_cols)
+  mask = shape_lib.pad_to_next_multiple_of(mask, m=MIN_MASK_COLS, axis=-1)
+  return mask.reshape(*mask.shape[:-2], -1)
+
+
 def unpack_bool_bits_tmem_native(a):
   """Unpacks boolean bits from an int packed array in TMEM_NATIVE layout."""
   packed_bits = mgpu_lib.num_bits(a.dtype)
@@ -255,7 +361,7 @@ def unpack_bool_bits_tmem_native(a):
       arg_types=(plgpu.Layout.TCGEN05_TMEM_NATIVE(32 // packed_bits),),
       return_type=plgpu.ShapeDtypeStruct(
           (128, target_cols),
-          jnp.bool_,
+          jnp.bool_,  # pyrefly: ignore[bad-argument-type]
           out_layout,
       ),
   )
@@ -303,3 +409,108 @@ def safe_downcast(
     return arr
   finfo = jnp.finfo(target_dtype)
   return jnp.clip(arr, finfo.min, finfo.max).astype(target_dtype)
+
+
+@plgpu.inline_mgpu()
+def commit_cp_async_group(_):
+  """Commits an empty `cp.async` group to keep wait_group counts constant."""
+  nvvm.cp_async_commit_group()
+
+
+def cp_async_gmem_to_smem(src, dst, swizzle: int | None = None):
+  """Issues a 2D tiled `cp.async` from any strided GMEM slice into SMEM.
+
+  SMEM scratch refs no longer carry their tiling/swizzle in `dst.transforms`,
+  so the swizzle must be supplied to match the allocation. A mismatch raises a
+  "Transform mismatch" error during lowering.
+
+  Args:
+    src: The GMEM source ref (2D, contiguous minor dimension).
+    dst: The SMEM destination ref, allocated with
+      `mosaic_gpu.tiled_swizzled_smem` (default `tiling_prefix`).
+    swizzle: The swizzle used for the `dst` allocation. Defaults to
+      `tiled_swizzled_smem`'s default; pass it when the allocation overrides it.
+  """
+  elem_bits = mgpu_lib.num_bits(dst.dtype)
+  if swizzle is None:
+    swizzle = plgpu.find_swizzle(dst.shape[-1] * elem_bits)
+  tiling = (8, 8 * swizzle // elem_bits)
+  src_kw: dict[str, Any] = (
+      {"write": False} if hasattr(plgpu.RefType, "write") else {}
+  )
+  dst_kw: dict[str, Any] = (
+      {"read": False} if hasattr(plgpu.RefType, "read") else {}
+  )
+  src_ty = plgpu.RefType(**src_kw)
+  dst_ty = plgpu.RefType(
+      transforms=(
+          plgpu.TilingTransform(tiling),
+          plgpu.SwizzleTransform(swizzle),
+      ),
+      **dst_kw,
+  )
+
+  @plgpu.inline_mgpu(arg_types=(src_ty, dst_ty))
+  def _copy(_, gmem_view, smem_view):
+    i32 = ir.IntegerType.get_signless(32)
+    i64 = ir.IntegerType.get_signless(64)
+    gmem_ref_ty = ir.MemRefType(gmem_view.type)
+    smem_ref_ty = ir.MemRefType(smem_view.type)
+    if gmem_ref_ty.rank != 2:
+      raise NotImplementedError(f"Expected 2D GMEM view, got {gmem_ref_ty}")
+    element_type = gmem_ref_ty.element_type
+    element_bitwidth = mgpu.bitwidth(element_type)
+    if element_bitwidth < 8:
+      raise NotImplementedError(
+          f"Sub-byte cp.async unsupported: {element_type}"
+      )
+    is_f8 = (
+        isinstance(element_type, ir.FloatType)
+        and ir.FloatType(element_type).width == 8
+    )
+    gep_type = ir.IntegerType.get_signless(8) if is_f8 else element_type
+    gmem_strides, _ = gmem_ref_ty.get_strides_and_offset()
+    if gmem_strides[-1] != 1:
+      raise NotImplementedError(
+          f"Expected contiguous minor GMEM stride, got {gmem_strides}"
+      )
+    layout = mgpu.fragmented_array.tiled_copy_smem_gmem_layout(
+        *smem_ref_ty.shape[-4:-2], swizzle, element_bitwidth  # pyrefly: ignore[bad-argument-count]
+    )
+    dst_tiled_strides = [
+        arith.constant(i32, s)
+        for s in layout.tiling.tile_strides(tuple(gmem_strides))[
+            gmem_ref_ty.rank :
+        ]
+    ]
+    lane_offset = mgpu.utils.dyn_dot(layout.lane_indices(), dst_tiled_strides)
+    warp_offset = mgpu.utils.dyn_dot(layout.warp_indices(), dst_tiled_strides)
+    dyn_offset = arith.extui(i64, arith.addi(lane_offset, warp_offset))
+    transfers = mgpu.FragmentedArray.transfer_tiled(
+        smem_view, swizzle, layout, tuple(gmem_ref_ty.shape), optimized=False
+    )
+    gmem_base_ptr = mgpu.utils.getelementptr(
+        mgpu.utils.memref_ptr(gmem_view), [dyn_offset], gep_type
+    )
+    gmem_base_ptr = llvm.addrspacecast(
+        llvm.PointerType.get(address_space=1), gmem_base_ptr
+    )
+    bytes_per_transfer = layout.vector_length * element_bitwidth // 8
+    cache_modifier = (
+        nvvm.LoadCacheModifierKind.CG
+        if bytes_per_transfer == 16
+        else nvvm.LoadCacheModifierKind.CA
+    )
+    for _, _, get_base_idx, smem_ptr in transfers:
+      constant_offset = sum(
+          i * s for i, s in zip(get_base_idx(), gmem_strides, strict=True)
+      )
+      gmem_ptr = mgpu.utils.getelementptr(
+          gmem_base_ptr, [constant_offset], gep_type
+      )
+      nvvm.cp_async_shared_global(
+          smem_ptr, gmem_ptr, bytes_per_transfer, cache_modifier
+      )
+    nvvm.cp_async_commit_group()
+
+  _copy(src, dst)

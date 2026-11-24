@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -22,6 +24,43 @@ import numpy as np
 import qwix
 from tokamax._src import batching
 from tokamax._src import numerics
+
+
+class _ShardedCustomArrayInitializer(numerics.ArrayInitializer):
+
+  def __init__(
+      self,
+      shape: tuple[int, ...],
+      dtype: jax.typing.DTypeLike,
+      sharding: jax.sharding.Sharding | None = None,
+      custom_attr: str = 'test_value',
+  ):
+    self._shape = shape
+    self._dtype = jnp.dtype(dtype)
+    self.sharding = sharding
+    self.custom_attr = custom_attr
+
+  @property
+  def shape(self) -> tuple[int, ...]:
+    return self._shape
+
+  @property
+  def dtype(self) -> jnp.dtype:
+    return self._dtype
+
+  def __call__(self, rng: np.random.Generator) -> np.ndarray:
+    del rng
+    return np.ones(self.shape, dtype=self.dtype)
+
+  def with_sharding(
+      self, sharding: jax.sharding.Sharding
+  ) -> '_ShardedCustomArrayInitializer':
+    return _ShardedCustomArrayInitializer(
+        self._shape,
+        self._dtype,
+        sharding=sharding,
+        custom_attr=self.custom_attr,
+    )
 
 
 class NumericsTest(parameterized.TestCase):
@@ -113,12 +152,14 @@ class NumericsTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(kwargs, kwargs_expected)
 
-  @parameterized.parameters(jnp.bool_, jnp.float32, jnp.int32, jnp.uint8)
-  def test_random_initialize_layout(self, dtype):
+  @parameterized.product(
+      dtype=(jnp.bool_, jnp.float32, jnp.int32, jnp.uint8),
+      shape=((2, 3, 4), (64, 128, 128)),
+  )
+  def test_random_initialize_layout(self, dtype, shape):
     if jax.default_backend() == 'tpu':
       self.skipTest('Test broken on TPU')
 
-    shape = (2, 3, 4)
     no_sharding = jax.sharding.make_single_device_sharding(jax.devices()[0])
     format_ = layout.Format(layout.Layout((1, 2, 0), ()), no_sharding)
     spec_with_layout = jax.ShapeDtypeStruct(shape, dtype, sharding=format_)
@@ -129,6 +170,7 @@ class NumericsTest(parameterized.TestCase):
 
   @parameterized.product(
       qtype=(jnp.float8_e4m3fn, jnp.int8, jnp.int4),
+      shape=((256, 256), (1024, 1024)),
       scale=(
           jax.ShapeDtypeStruct((1, 128), jnp.bfloat16),
           jax.ShapeDtypeStruct((128, 1), jnp.bfloat16),
@@ -136,8 +178,8 @@ class NumericsTest(parameterized.TestCase):
       ),
       explicit_qtype=(True, False),
   )
-  def test_random_initialize_qarray(self, qtype, scale, explicit_qtype):
-    qvalue = jax.ShapeDtypeStruct((256, 256), qtype)
+  def test_random_initialize_qarray(self, qtype, shape, scale, explicit_qtype):
+    qvalue = jax.ShapeDtypeStruct(shape, qtype)
     kwargs = dict(qtype=qtype) if explicit_qtype else {}
     q = qwix.QArray(qvalue, scale, **kwargs)  # pyrefly: ignore[bad-argument-type]
     q = numerics.random_initialize(q)
@@ -150,15 +192,50 @@ class NumericsTest(parameterized.TestCase):
     self.assertGreater(q_rms, 0.8)
     self.assertLess(q_rms, 1.2)
 
-  def test_ranged_array_initializer(self):
-    x = numerics.RangedArrayInitializer((128, 128), jnp.int32, 3, 7)
-    x = numerics.random_initialize(x)
-    self.assertEqual(jnp.min(x), 3)
-    self.assertEqual(jnp.max(x), 6)
+  @parameterized.parameters(((128, 128), 1), ((1024, 1024), 0))
+  def test_ranged_array_initializer(self, shape, expected_device_puts):
+    x = numerics.RangedArrayInitializer(shape, jnp.int32, 3, 7)
+    with mock.patch.object(
+        jax, 'device_put', wraps=jax.device_put
+    ) as mock_device_put:
+      x = numerics.random_initialize(x)
+    self.assertEqual(mock_device_put.call_count, expected_device_puts)
+    self.assertEqual(x.shape, shape)
+    self.assertEqual(x.dtype, jnp.int32)
+    self.assertGreaterEqual(int(jnp.min(x)), 3)
+    self.assertLess(int(jnp.max(x)), 7)
 
-  def test_seed(self):
-    a = batching.BatchedShapeDtype((16,), jnp.int4, vmap_axes=((0, 16),))
-    b = jax.ShapeDtypeStruct((16, 16), jnp.int4)
+  @parameterized.parameters(((128, 128), 1), ((1024, 1024), 0))
+  def test_float_ranged_array_initializer(self, shape, expected_device_puts):
+    x = numerics.FloatRangedArrayInitializer(shape, jnp.float32, 0.5, 2.0)
+    with mock.patch.object(
+        jax, 'device_put', wraps=jax.device_put
+    ) as mock_device_put:
+      x = numerics.random_initialize(x)
+    self.assertEqual(mock_device_put.call_count, expected_device_puts)
+    self.assertEqual(x.shape, shape)
+    self.assertEqual(x.dtype, jnp.float32)
+    self.assertGreaterEqual(float(jnp.min(x)), 0.5)
+    self.assertLess(float(jnp.max(x)), 2.0)
+
+  @parameterized.parameters(((16, 16), 2), ((1024, 1024), 0))
+  def test_host_vs_device_initialization(self, shape, expected_device_puts):
+    qvalue = jax.ShapeDtypeStruct(shape, jnp.int4)
+    scale = jax.ShapeDtypeStruct((shape[0], 4), jnp.bfloat16)
+    spec = {
+        'a': qvalue,
+        'q': qwix.QArray(qvalue, scale),  # pyrefly: ignore[bad-argument-type]
+    }
+    with mock.patch.object(
+        jax, 'device_put', wraps=jax.device_put
+    ) as mock_device_put:
+      numerics.random_initialize(spec)
+    self.assertEqual(mock_device_put.call_count, expected_device_puts)
+
+  @parameterized.parameters(16, 1024)
+  def test_seed(self, n):
+    a = batching.BatchedShapeDtype((n,), jnp.int4, vmap_axes=((0, n),))
+    b = jax.ShapeDtypeStruct((n, n), jnp.int4)
 
     a_random = numerics.random_initialize(a)
     b_random = numerics.random_initialize(b)
@@ -169,6 +246,43 @@ class NumericsTest(parameterized.TestCase):
     chex.assert_trees_all_equal(a_random_2, b_random_2)
 
     self.assertFalse(jnp.array_equal(a_random, a_random_2))
+
+  def test_random_initialize_multi_process(self):
+    spec = {
+        'a': jax.ShapeDtypeStruct((16,), jnp.float32),
+        'b': jax.ShapeDtypeStruct((16,), jnp.int32),
+    }
+    expected = numerics.random_initialize(spec, seed=0)
+    with (
+        mock.patch.object(jax, 'process_count', return_value=2),
+        mock.patch.object(numerics.futures, 'ThreadPoolExecutor') as mock_pool,
+    ):
+      actual = numerics.random_initialize(spec, seed=0)
+    mock_pool.assert_not_called()
+    chex.assert_trees_all_equal(actual, expected)
+
+  def test_random_initialize_sharded_custom_array_initializer(self):
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ('x',))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
+    sharded_init = _ShardedCustomArrayInitializer(
+        (8, 16), jnp.float32, sharding=sharding, custom_attr='custom_field'
+    )
+    resharded_init = sharded_init.with_sharding(sharding)
+    self.assertEqual(resharded_init.custom_attr, 'custom_field')
+    self.assertEqual(resharded_init.sharding, sharding)
+
+    out_sharded = numerics.random_initialize(sharded_init)
+    self.assertEqual(out_sharded.sharding, sharding)
+    self.assertEqual(out_sharded.shape, (8, 16))
+    self.assertTrue((np.array(out_sharded) == 1.0).all())
+
+    unsharded_init = _ShardedCustomArrayInitializer(
+        (8, 16), jnp.float32, custom_attr='custom_field'
+    )
+    out_unsharded = numerics.random_initialize(unsharded_init)
+    self.assertIsNone(unsharded_init.sharding)
+    self.assertEqual(out_unsharded.shape, (8, 16))
+    self.assertTrue((np.array(out_unsharded) == 1.0).all())
 
 
 if __name__ == '__main__':

@@ -24,6 +24,22 @@ import jax.numpy as jnp
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
 
 
+def _flat_pos(shape: tuple[int, ...], indices: tuple[Any, ...]) -> Any:
+  """Row-major flat offset of `indices` into a logical array of `shape`."""
+  strides = pl.strides_from_shape(shape)
+  assert len(strides) == len(indices)
+
+  pos = 0
+  for stride, idx in zip(strides, indices):
+    pos += stride * idx
+  return pos
+
+
+def granule_view(ref: jax.Ref, leading_shape: tuple[int, ...]) -> jax.Ref:
+  num_lanes = pltpu.get_tpu_info().num_lanes
+  return ref.bitcast(jnp.uint32).reshape(*leading_shape, -1, 1, num_lanes)  # pyrefly: ignore[missing-attribute]
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class ConvWeightsRef:
@@ -45,38 +61,121 @@ class WeightRefs:
   gdn: GDNWeightsRef
 
 
-@jax.tree_util.register_dataclass
+class FieldOffset:
+  """Descriptor returning the record field at ``data[pos + offset]``.
+
+  Reads a single dynamically-indexed element rather than a slice, since JAX
+  can't slice a range with traced indices. Read-only: metadata is never
+  written.
+  """
+
+  def __init__(self, offset: int):
+    self.offset = offset
+
+  def __get__(self, obj, objtype=None):
+    if obj is None:
+      return self
+    return obj.data[obj.pos + self.offset]
+
+
+# Per-p_id metadata is an array of structs: each p_id's fields sit contiguously
+# and FieldOffset(k) reads the k-th word of its struct.
+#
+# Packed struct: [r_base, packed_word].
+# Fields share packed_word to save SMEM: is_first_tile(0), is_last_tile(1),
+# r_size(2..15), s_idx(16..31).
 @dataclasses.dataclass(frozen=True)
-class SmemWrapper:
-  """Maps physical 1-D data into logical N-D representation."""
+class PackedPIdRecord:
+  """Packed struct [r_base, packed_word]; the four small fields bit-slice word.
+
+  Each bit field masks after shifting, which also clears the sign bits that
+  ``>>`` extends on the signed int32 word.
+  """
+
+  STRUCT_SIZE = 2
+  FIRST_TILE_SHIFT = 0
+  LAST_TILE_SHIFT = 1
+  R_SIZE_SHIFT = 2
+  S_IDX_SHIFT = 16
+  FLAG_MASK = 1
+  R_SIZE_MASK = (1 << (S_IDX_SHIFT - R_SIZE_SHIFT)) - 1
+  S_IDX_MASK = (1 << (32 - S_IDX_SHIFT)) - 1
+  MAX_SEQS = S_IDX_MASK + 1
 
   data: Any
-  shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
+  pos: Any
+  r_base = FieldOffset(0)
+  word = FieldOffset(1)
 
-  def _get_pos(self, indices: tuple[Any, ...]) -> Any:
-    strides = pl.strides_from_shape(self.shape)
-    assert len(strides) == len(indices)
+  @property
+  def s_idx(self):
+    return (self.word >> self.S_IDX_SHIFT) & self.S_IDX_MASK
 
-    pos = 0
-    for stride, idx in zip(strides, indices):
-      pos += stride * idx
-    return pos
+  @property
+  def r_size(self):
+    return (self.word >> self.R_SIZE_SHIFT) & self.R_SIZE_MASK
 
-  def __getitem__(self, indices: tuple[Any, ...]) -> Any:
-    return self.data[self._get_pos(indices)]
+  @property
+  def is_first_tile(self):
+    return (self.word & self.FLAG_MASK) != 0
+
+  @property
+  def is_last_tile(self):
+    return ((self.word >> self.LAST_TILE_SHIFT) & self.FLAG_MASK) != 0
+
+  @classmethod
+  def pack(
+      cls,
+      s_idx: jax.Array,
+      r_size: jax.Array,
+      is_first_tile: jax.Array,
+      is_last_tile: jax.Array,
+  ) -> jax.Array:
+    """Packs s_idx, row size and two tile-state flags into one int32 word."""
+
+    s_idx = s_idx.reshape(-1).astype(jnp.int32)
+    # PER_SEQ pads unused slots with large negative sizes; shifting one of
+    # those left would set the high bits and overwrite s_idx.
+    r_size = jnp.maximum(r_size.reshape(-1).astype(jnp.int32), 0)
+    is_first_tile = is_first_tile.reshape(-1).astype(jnp.int32)
+    is_last_tile = is_last_tile.reshape(-1).astype(jnp.int32)
+    word = s_idx << cls.S_IDX_SHIFT
+    word |= r_size << cls.R_SIZE_SHIFT
+    word |= is_last_tile << cls.LAST_TILE_SHIFT
+    word |= is_first_tile << cls.FIRST_TILE_SHIFT
+    return word
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class MetadataRef:
   num_tiles: Any
-  p_id_to_s_idx: SmemWrapper
-  p_id_to_r_base: SmemWrapper
-  p_id_to_r_size: SmemWrapper
-  p_id_is_first_tile: SmemWrapper
-  p_id_is_last_tile: SmemWrapper
+  # Array of structs holding every p_id's metadata
+  records: Any
   s_idx_has_initial_state: Any
   s_idx_to_state_indices: Any
+  # Per-sequence state read offset for speculative decoding: the initial
+  # state is read from `s_idx_to_read_indices[s] + s_idx_to_read_offset[s]`
+  # (the checkpoint of the last accepted token). Zero everywhere without
+  # speculative decoding.
+  s_idx_to_read_offset: Any
+  # Slot the initial state is read from. Equal to `s_idx_to_state_indices`
+  # unless mamba prefix caching is on, where a sequence resumes from the
+  # cached state block of the previous block boundary and checkpoints into
+  # a different block (see `cache_config.mamba_cache_mode == "align"`).
+  s_idx_to_read_indices: Any
+  # Per-sequence, per-checkpoint state slot indices of shape
+  # `[max_seqs, window_size]`, or `None` to address checkpoints as contiguous
+  # offsets from `s_idx_to_read_indices` / `s_idx_to_state_indices`.
+  s_idx_to_ckpt_indices: Any
+  shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
+
+  def get_record(self, p_id, idx) -> PackedPIdRecord:
+    """View of one p_id's metadata: .r_base / .s_idx / .r_size / .is_*_tile."""
+    record_idx = _flat_pos(self.shape, (p_id, idx))
+    return PackedPIdRecord(
+        self.records, record_idx * PackedPIdRecord.STRUCT_SIZE
+    )
 
   @classmethod
   def create(
@@ -90,18 +189,48 @@ class MetadataRef:
       p_id_is_last_tile: jax.Array,
       s_idx_has_initial_state: jax.Array,
       s_idx_to_state_indices: jax.Array,
-  ) -> 'MetadataRef':
+      s_idx_to_read_offset: jax.Array,
+      s_idx_to_read_indices: jax.Array,
+      s_idx_to_ckpt_indices: jax.Array | None = None,
+  ) -> "MetadataRef":
     # NOTE: First dim does not matter when it comes to calculating stride.
     shape = (1, cfgs.seq_tile_size)
+    assert s_idx_has_initial_state.shape[0] <= PackedPIdRecord.MAX_SEQS, (
+        f"Number of sequences ({s_idx_has_initial_state.shape[0]}) exceeds"
+        f" PackedPIdRecord limit ({PackedPIdRecord.MAX_SEQS})."
+    )
+    assert cfgs.tile_size <= PackedPIdRecord.R_SIZE_MASK, (
+        f"Tile size ({cfgs.tile_size}) exceeds PackedPIdRecord limit"
+        f" ({PackedPIdRecord.R_SIZE_MASK})."
+    )
+
+    r_base = p_id_to_r_base.reshape(-1).astype(jnp.int32)
+    word = PackedPIdRecord.pack(
+        p_id_to_s_idx, p_id_to_r_size, p_id_is_first_tile, p_id_is_last_tile
+    )
+    # Every tile reads all `seq_tile_size` of its records, so the last tile
+    # reads up to `seq_tile_size - 1` records past the valid ones. Round the
+    # record count up so those reads hit zeroed records instead of whatever
+    # SMEM follows: a zero word is s_idx 0, r_size 0 and both tile flags
+    # false, which issues no DMA.
+    pad = -r_base.shape[0] % cfgs.seq_tile_size
+    if pad:
+      r_base = jnp.pad(r_base, (0, pad))
+      word = jnp.pad(word, (0, pad))
+
+    fields = [r_base, word]
+    # Interleave fields into one array of structs: [rec0_f0, rec0_f1, ...].
+    records = jnp.stack(fields, axis=-1).reshape(-1)
+
     return cls(
         num_tiles=num_tiles,
-        p_id_to_s_idx=SmemWrapper(p_id_to_s_idx, shape),
-        p_id_to_r_base=SmemWrapper(p_id_to_r_base, shape),
-        p_id_to_r_size=SmemWrapper(p_id_to_r_size, shape),
-        p_id_is_first_tile=SmemWrapper(p_id_is_first_tile, shape),
-        p_id_is_last_tile=SmemWrapper(p_id_is_last_tile, shape),
+        records=records,
         s_idx_has_initial_state=s_idx_has_initial_state,
         s_idx_to_state_indices=s_idx_to_state_indices,
+        s_idx_to_read_offset=s_idx_to_read_offset,
+        s_idx_to_read_indices=s_idx_to_read_indices,
+        s_idx_to_ckpt_indices=s_idx_to_ckpt_indices,
+        shape=shape,
     )
 
   def __len__(self) -> int:
@@ -127,6 +256,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
       use_lookahead: bool,
       cfg: config.GDNConfig,
       metadata_ref: MetadataRef,
+      **fields,
   ):
     standard_ref = pltpu.BufferedRef.create(
         spec=spec,
@@ -139,6 +269,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
     return cls(
         cfg=cfg,
         metadata_ref=metadata_ref,
+        **fields,
         **{
             f.name: getattr(standard_ref, f.name)
             for f in dataclasses.fields(pltpu.BufferedRef)
@@ -159,8 +290,9 @@ class InBufferedRef(BaseBufferedRef):
     p_id = grid_indices[0]
 
     for idx in range(self.cfg.seq_tile_size):
-      r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
-      dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+      record = self.metadata_ref.get_record(p_id, idx)
+      r_base = record.r_base
+      dma_size = record.r_size
       pltpu.make_async_copy(
           src_ref.at[pl.ds(r_base, dma_size)],
           vmem_ref.at[idx, pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
@@ -177,13 +309,13 @@ class InBufferedRef(BaseBufferedRef):
 
     dma_size = 0
     for idx in range(self.cfg.seq_tile_size):
-      dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
+      dma_size += self.metadata_ref.get_record(p_id, idx).r_size
 
-    pltpu.make_async_copy(
-        vmem_ref.at[0, pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-        vmem_ref.at[0, pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-        sem,
-    ).wait()
+    # NOTE: With bounds checks disabled, the self-copy descriptor may
+    # nominally exceed the window row; it is never executed, only used
+    # to wait for the same number of bytes `copy_in` issued.
+    wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]  # pyrefly: ignore[missing-attribute]
+    pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -199,8 +331,9 @@ class OutBufferedRef(BaseBufferedRef):
     p_id = grid_indices[0]
 
     for idx in range(self.cfg.seq_tile_size):
-      r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
-      dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+      record = self.metadata_ref.get_record(p_id, idx)
+      r_base = record.r_base
+      dma_size = record.r_size
       pltpu.make_async_copy(
           vmem_ref.at[idx, pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
           dst_ref.at[pl.ds(r_base, dma_size)],
@@ -217,18 +350,50 @@ class OutBufferedRef(BaseBufferedRef):
 
     dma_size = 0
     for idx in range(self.cfg.seq_tile_size):
-      dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
+      dma_size += self.metadata_ref.get_record(p_id, idx).r_size
 
-    pltpu.make_async_copy(
-        vmem_ref.at[0, pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-        vmem_ref.at[0, pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-        sem,
-    ).wait()
+    # NOTE: With bounds checks disabled, the self-copy descriptor may
+    # nominally exceed the window row; it is never executed, only used
+    # to wait for the same number of bytes `copy_out` issued.
+    wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]  # pyrefly: ignore[missing-attribute]
+    pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class StateBufferedRef(BaseBufferedRef):
+class _GranuleStateRef(BaseBufferedRef):
+  """Shared addressing of the per-sequence state refs below.
+
+  A state block is addressed in 512-byte granules (`granule_view`): one
+  unified-pool row holds both state regions, told apart by `offset`, and a
+  dense state tensor is the same view with `offset` 0.
+  """
+
+  # HBM address offset.
+  offset: int = dataclasses.field(default=0, metadata=dict(static=True))
+
+  def _read_ckpt_state_idx(self, s_idx, ckpt):
+    ckpt_indices = self.metadata_ref.s_idx_to_ckpt_indices
+    if ckpt_indices is None:
+      return self.metadata_ref.s_idx_to_read_indices[s_idx] + ckpt
+    return ckpt_indices[s_idx, ckpt]
+
+  def _write_ckpt_state_idx(self, s_idx, ckpt):
+    ckpt_indices = self.metadata_ref.s_idx_to_ckpt_indices
+    if ckpt_indices is None:
+      return self.metadata_ref.s_idx_to_state_indices[s_idx] + ckpt
+    return ckpt_indices[s_idx, ckpt]
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class StateInBufferedRef(_GranuleStateRef):
+  """Input buffered ref for per-sequence initial state (conv / recurrent).
+
+  The VMEM window holds one initial state per sequence in the tile,
+  [seq_tile_size, 1, *state_shape], read from the checkpoint at
+  `read_offset[s]` into position 0 of row `idx`.
+  """
 
   def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
     assert self.sem_recvs is not None
@@ -238,18 +403,28 @@ class StateBufferedRef(BaseBufferedRef):
     vmem_ref = self.window_ref.at[slot]
     p_id = grid_indices[0]
 
-    for idx in range(self.cfg.seq_tile_size):
+    src_ref = granule_view(src_ref, src_ref.shape[:1])
+    vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
+    state_granules = vmem_ref.shape[2]
 
-      is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
-      s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-      state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
+    for idx in range(self.cfg.seq_tile_size):
+      record = self.metadata_ref.get_record(p_id, idx)
+      is_first_tile = record.is_first_tile
+      s_idx = record.s_idx
       has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
       should_read = jnp.logical_and(is_first_tile, has_initial_state)
       dma_size = jnp.where(should_read, 1, 0)
 
+      # Resume from the checkpoint of the last accepted token.
+      read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
+      state_idx = self._read_ckpt_state_idx(s_idx, read_ckpt)
+
       pltpu.make_async_copy(
-          src_ref.at[pl.ds(state_idx, dma_size)],
-          vmem_ref.at[pl.ds(idx, dma_size)],  # pyrefly: ignore[missing-attribute]
+          src_ref.at[
+              pl.ds(state_idx, dma_size),
+              pl.ds(self.offset, state_granules),
+          ],
+          vmem_ref.at[idx, pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
           sem,
       ).start()
 
@@ -263,17 +438,32 @@ class StateBufferedRef(BaseBufferedRef):
 
     dma_size = 0
     for idx in range(self.cfg.seq_tile_size):
-      is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
-      s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+      record = self.metadata_ref.get_record(p_id, idx)
+      is_first_tile = record.is_first_tile
+      s_idx = record.s_idx
       has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
       should_read = jnp.logical_and(is_first_tile, has_initial_state)
       dma_size += jnp.where(should_read, 1, 0)
 
-    pltpu.make_async_copy(
-        vmem_ref.at[pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-        vmem_ref.at[pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-        sem,
-    ).wait()
+    # NOTE: With bounds checks disabled, the self-copy descriptor may
+    # nominally exceed the window row; it is never executed, only used
+    # to wait for the same number of bytes `copy_in` issued.
+    wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]  # pyrefly: ignore[missing-attribute]
+    pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class StateOutBufferedRef(_GranuleStateRef):
+  """Output buffered ref for per-sequence state checkpoints (conv / recurrent).
+
+  The VMEM window holds one state per window position,
+  [seq_tile_size, window_size, *state_shape]. After compute, the first
+  `min(r_size, window_size)` checkpoints are written back to each checkpoint's
+  state slot. Keeping loads in a separate window stops the load for tile
+  p + 2, issued during step p + 1, from overwriting the slot that tile p's
+  store is still reading.
+  """
 
   def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
     assert self.sem_sends is not None
@@ -283,17 +473,32 @@ class StateBufferedRef(BaseBufferedRef):
     vmem_ref = self.window_ref.at[slot]
     p_id = grid_indices[0]
 
-    for idx in range(self.cfg.seq_tile_size):
-      is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
-      s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-      state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
-      dma_size = jnp.where(is_last_tile, 1, 0)
+    dst_ref = granule_view(dst_ref, dst_ref.shape[:1])
+    vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
+    state_granules = vmem_ref.shape[2]
 
-      pltpu.make_async_copy(
-          vmem_ref.at[pl.ds(idx, dma_size)],  # pyrefly: ignore[missing-attribute]
-          dst_ref.at[pl.ds(state_idx, dma_size)],
-          sem,
-      ).start()
+    for idx in range(self.cfg.seq_tile_size):
+      record = self.metadata_ref.get_record(p_id, idx)
+      is_last_tile = record.is_last_tile
+      s_idx = record.s_idx
+      r_size = record.r_size
+      # Write one checkpoint per valid window position. `r_size` never
+      # exceeds `window_size` for windowed sequences; the clamp is for
+      # PER_SEQ tiles, which hold many tokens but keep only the final state.
+      num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+      for t in range(self.cfg.window_size):
+        state_idx = self._write_ckpt_state_idx(s_idx, t)
+        should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
+        dma_size = jnp.where(should_write, 1, 0)
+
+        pltpu.make_async_copy(
+            vmem_ref.at[pl.ds(idx, dma_size), t],  # pyrefly: ignore[missing-attribute]
+            dst_ref.at[
+                pl.ds(state_idx, dma_size),
+                pl.ds(self.offset, state_granules),
+            ],
+            sem,
+        ).start()
 
   def wait_out(self, dst_ref: jax.Array, grid_indices: tuple[int | jax.Array]):
     assert self.sem_sends is not None
@@ -305,14 +510,17 @@ class StateBufferedRef(BaseBufferedRef):
 
     dma_size = 0
     for idx in range(self.cfg.seq_tile_size):
-      is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
-      dma_size += jnp.where(is_last_tile, 1, 0)
+      record = self.metadata_ref.get_record(p_id, idx)
+      is_last_tile = record.is_last_tile
+      r_size = record.r_size
+      num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+      dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
-    pltpu.make_async_copy(
-        vmem_ref.at[pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-        vmem_ref.at[pl.ds(0, dma_size)],  # pyrefly: ignore[missing-attribute]
-        sem,
-    ).wait()
+    # NOTE: With bounds checks disabled, the self-copy descriptor may
+    # nominally exceed the window row; it is never executed, only used
+    # to wait for the same number of bytes `copy_out` issued.
+    wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]  # pyrefly: ignore[missing-attribute]
+    pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 def create_allocs(
@@ -321,19 +529,22 @@ def create_allocs(
     b_ref: jax.Array,
     a_ref: jax.Array,
     out_ref: jax.Array,
-    conv_state_ref: jax.Array,
-    recurrent_state_ref: jax.Array,
     cfg: config.GDNConfig,
 ) -> tuple[
     InBufferedRef,
     InBufferedRef,
     InBufferedRef,
-    StateBufferedRef,
-    StateBufferedRef,
+    StateInBufferedRef,
+    StateInBufferedRef,
     OutBufferedRef,
+    StateOutBufferedRef,
+    StateOutBufferedRef,
 ]:
   qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
-  ba_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
+  b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
+  # Same shape as b under GDN; under KDA the gate is per-channel, so it is
+  # d_k times wider (see GDNConfig.gate_dim).
+  a_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_gate_dim)
 
   out_shape = (
       cfg.seq_tile_size,
@@ -341,11 +552,37 @@ def create_allocs(
       cfg.num_v_heads,
       cfg.v_head_dim,
   )
-  conv_shape = (cfg.seq_tile_size, cfg.prev_kernel_size, 1, cfg.dim_size)
-  recurrent_shape = (
+  # Initial state needs only 1 slot per sequence; output holds one checkpoint
+  # per window position (1 without speculative decoding).
+  # Pack sub-32-bit recurrent state along the sublane dim so the window is a
+  # 32-bit type (`granule_view` bitcasts it to `uint32`).
+  packing = 4 // jnp.dtype(cfg.dtypes.recurrent_state).itemsize
+  conv_in_shape = (
       cfg.seq_tile_size,
+      1,
+      cfg.prev_kernel_size,
+      1,
+      cfg.dim_size,
+  )
+  recurrent_in_shape = (
+      cfg.seq_tile_size,
+      1,
       cfg.num_v_heads,
-      cfg.kq_head_dim,
+      cfg.kq_head_dim // packing,
+      cfg.v_head_dim,
+  )
+  conv_out_shape = (
+      cfg.seq_tile_size,
+      cfg.window_size,
+      cfg.prev_kernel_size,
+      1,
+      cfg.dim_size,
+  )
+  recurrent_out_shape = (
+      cfg.seq_tile_size,
+      cfg.window_size,
+      cfg.num_v_heads,
+      cfg.kq_head_dim // packing,
       cfg.v_head_dim,
   )
 
@@ -359,7 +596,8 @@ def create_allocs(
   )
 
   qkv_spec = block_spec_partial(block_shape=qkv_shape)
-  ba_spec = block_spec_partial(block_shape=ba_shape)
+  b_spec = block_spec_partial(block_shape=b_shape)
+  a_spec = block_spec_partial(block_shape=a_shape)
   in_buffered_partial = functools.partial(
       InBufferedRef.input,
       buffer_count=pipeline_mode.buffer_count,
@@ -368,8 +606,8 @@ def create_allocs(
       metadata_ref=metadata_ref,
   )
   qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
-  b_alloc = in_buffered_partial(spec=ba_spec, dtype_or_type=b_ref)
-  a_alloc = in_buffered_partial(spec=ba_spec, dtype_or_type=a_ref)
+  b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
+  a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
 
   out_alloc = OutBufferedRef.output(
       spec=block_spec_partial(block_shape=out_shape),
@@ -380,20 +618,49 @@ def create_allocs(
       metadata_ref=metadata_ref,
   )
 
-  conv_spec = block_spec_partial(block_shape=conv_shape)
-  recurrent_spec = block_spec_partial(block_shape=recurrent_shape)
-  state_buffered_partial = functools.partial(
-      StateBufferedRef.input_output,
+  state_in_partial = functools.partial(
+      StateInBufferedRef.input,
       buffer_count=pipeline_mode.buffer_count,
       use_lookahead=pipeline_mode.use_lookahead,
       cfg=cfg,
       metadata_ref=metadata_ref,
   )
-  conv_alloc = state_buffered_partial(
-      spec=conv_spec, dtype_or_type=conv_state_ref
+  conv_in_alloc = state_in_partial(
+      spec=block_spec_partial(block_shape=conv_in_shape),
+      dtype_or_type=cfg.dtypes.conv_state,
+      offset=cfg.conv_hbm_offset,
   )
-  recurrent_alloc = state_buffered_partial(
-      spec=recurrent_spec, dtype_or_type=recurrent_state_ref
+  recurrent_in_alloc = state_in_partial(
+      spec=block_spec_partial(block_shape=recurrent_in_shape),
+      dtype_or_type=jnp.uint32,
+      offset=cfg.recurrent_hbm_offset,
   )
 
-  return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc
+  state_out_partial = functools.partial(
+      StateOutBufferedRef.output,
+      buffer_count=pipeline_mode.buffer_count,
+      use_lookahead=pipeline_mode.use_lookahead,
+      cfg=cfg,
+      metadata_ref=metadata_ref,
+  )
+  conv_out_alloc = state_out_partial(
+      spec=block_spec_partial(block_shape=conv_out_shape),
+      dtype_or_type=cfg.dtypes.conv_state,
+      offset=cfg.conv_hbm_offset,
+  )
+  recurrent_out_alloc = state_out_partial(
+      spec=block_spec_partial(block_shape=recurrent_out_shape),
+      dtype_or_type=jnp.uint32,
+      offset=cfg.recurrent_hbm_offset,
+  )
+
+  return (
+      qkv_alloc,
+      b_alloc,
+      a_alloc,
+      conv_in_alloc,
+      recurrent_in_alloc,
+      out_alloc,
+      conv_out_alloc,
+      recurrent_out_alloc,
+  )

@@ -22,6 +22,7 @@ import contextvars
 import dataclasses
 import functools
 import inspect
+import re
 from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final, overload
 
 from absl import logging
@@ -41,7 +42,9 @@ from tokamax._src import shape
 from tokamax._src import utils
 from tokamax._src.autotuning import autotuner as autotuner_lib
 from tokamax._src.autotuning import cache as autotuning_cache
+from tokamax._src.ops import fuser_adapter
 
+AutotuningCacheMissFallback = config_lib.AutotuningCacheMissFallback
 AutotuningData = autotuner_lib.AutotuningData
 DeviceKind = autotuning_cache.DeviceKind
 
@@ -52,6 +55,7 @@ class NullConfig:
 
 
 _NULL_CONFIG: Final[NullConfig] = NullConfig()
+_CAMEL_TO_SNAKE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?!^)([A-Z])")
 
 
 @jax.tree_util.register_dataclass
@@ -127,8 +131,9 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       allowing for offline autotuning.
     - Retrieve a config for the `Op`.
       - The config is retrieved using `op.bind(...).default_config`. This can be
-        configured using the `tokamax_autotuning_cache_miss_fallback` config
-        option (see `BoundArguments.default_config`).
+        configured via `op.autotuning_cache_miss_fallback` or the
+        `tokamax_autotuning_cache_miss_fallback` config option (see
+        `BoundArguments.default_config`).
     - Call `_fwd` with the canonicalized arguments and config. If `op.vjp` is
       not `None`, it will be used to compute the gradients.
 
@@ -160,10 +165,15 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
   # instances in array shapes.
   supports_symbolic_shapes: ClassVar[bool] = True
   supports_batched_args_capture: ClassVar[bool] = True
+  fusible_argnames: ClassVar[tuple[str, ...] | None] = None
 
   config: C | None = None
   _: dataclasses.KW_ONLY
   bypass_device_check: bool = False
+  # Per-op override for `tokamax.config.autotuning_cache_miss_fallback`
+  # ('heuristics', 'autotune', or 'error'). When `None`, defers to the global
+  # config (which defaults to 'heuristics').
+  autotuning_cache_miss_fallback: AutotuningCacheMissFallback | None = None
   # VJP function for the op. `vjp` will be passed the residuals and the output
   # of the op, the output gradients, then all arguments passed to the op.
   # The VJP function must return a tuple of gradients for each positional
@@ -216,6 +226,16 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         if not self.supported_on(device):
           raise NotImplementedError(f"Not supported on {device.device_kind}.")
 
+    if fuser_adapter.in_op_fusion_context():
+      if type(self)._fusible_fwd is Op._fusible_fwd:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support kernel fusion"
+            " (@op_fusion.fuse)."
+        )
+      return fuser_adapter.call_fusible_op(
+          self, ba, return_residuals=return_residuals
+      )
+
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
     is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
     arrays, other, merge = utils.split_merge(is_array, args_flat)
@@ -234,11 +254,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       config = ba.default_config
 
       # Serialize args into the HLO to allow for, e.g., offline autotuning.
-      json_op = self.replace(config=config, vjp=None)
-      json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
-      json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
-
-      with _tokamax_metadata(json_data):
+      with ba._tokamax_metadata(config):  # pylint: disable=protected-access
         if fwd_res and self.vjp is None and batched_args is not None:
 
           def fwd_flat(*arrays):
@@ -263,8 +279,10 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         out, residuals = self._fwd(*args, config=config, **kwargs)
 
       ret = (out, residuals) if return_residuals else out
-      full_residuals = Residuals(args, kwargs, out, residuals)
-      return ret, _FlatTree(*jax.tree.flatten(full_residuals))
+      if self.vjp is None:
+        full_residuals = Residuals(args, kwargs, out, residuals)
+        return ret, _FlatTree(*jax.tree.flatten(full_residuals))
+      return ret, (out, residuals)
 
     def f(*arrays):
       return fwd(*arrays, fwd_res=False)[0]
@@ -276,8 +294,20 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       # We must wrap the op in a `custom_vjp`, even if no `vjp` function is
       # provided, as we use `custom_batching` to capture the batched arguments,
       # and `custom_batching` doesn't support `jax.vjp`.
-      bwd = lambda f_vjp, dout: f_vjp(dout[0] if return_residuals else dout)
+      fwd_vjp = fwd
+
+      @self._capture_batched_args
+      def bwd(f_vjp, dout, batched_args):
+        del batched_args  # Unused.
+        return f_vjp(dout[0] if return_residuals else dout)
     else:
+
+      def fwd_vjp(*arrays):
+        ret, (out, residuals) = fwd(*arrays, fwd_res=True)
+        args, kwargs = args_tree.unflatten(merge(arrays, other))
+        kwargs["return_residuals"] = True
+        full_residuals = Residuals(args, kwargs, out, residuals)
+        return ret, _FlatTree(*jax.tree.flatten(full_residuals))
 
       def bwd(residuals, dout):  # pylint: disable=function-redefined
         residuals = residuals.tree.unflatten(residuals.values)
@@ -287,29 +317,38 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         out = residuals.out
         residuals = residuals.residuals
         dout = dout[0] if return_residuals else dout
-        grads = self.vjp(residuals, out, dout, *args, **kwargs)
+        assert self.vjp is not None
+        if self.autotuning_cache_miss_fallback is not None:
+          with config_lib.autotuning_cache_miss_fallback(
+              self.autotuning_cache_miss_fallback
+          ):
+            grads = self.vjp(residuals, out, dout, *args, **kwargs)
+        else:
+          grads = self.vjp(residuals, out, dout, *args, **kwargs)
 
         if isinstance(grads, dict):
           grads_ba = ba.signature.bind_partial(**grads)
+          in_args = ba.signature.bind_partial(*args, **kwargs).arguments
         else:
           grads_ba = ba.signature.bind_partial(*grads)
+          in_args = kwargs
 
-        # Check that grads is tree with same structure as args.
-        dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
-
-        for k, v in kwargs.items():
-          if (dv := grads_ba.kwargs.get(k)) is None:
+        for k, v in in_args.items():
+          if (dv := grads_ba.arguments.get(k)) is None:
             # Set any missing grads to zeros.
             zeros_like = lambda x: jnp.zeros_like(x) if is_array(x) else x
             grads_ba.arguments[k] = jax.tree.map(zeros_like, v)
           else:
-            # Check that grads is tree with same structure as kwarg value.
+            # Check that grads is tree with same structure as arg/kwarg value.
             grads_ba.arguments[k] = jax.tree.map(lambda _, g: g, v, dv)
+
+        # Check that grads is tree with same structure as args.
+        dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
 
         return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
 
     f = jax.custom_vjp(f)
-    f.defvjp(fwd, bwd, optimize_remat=True)
+    f.defvjp(fwd_vjp, bwd, optimize_remat=True)
     return f(*arrays)
 
   def bind(
@@ -329,26 +368,48 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       object.__setattr__(new_op, "vjp", kwargs["vjp"])
     return new_op
 
+  def _cache_key_op(self) -> Self:
+    return self.replace(
+        config=None,
+        vjp=None,
+        bypass_device_check=False,
+        autotuning_cache_miss_fallback=None,
+    )
+
   def get_autotuning_cache(
       self, device_kind: DeviceKind | None = None
   ) -> dict[K, AutotuningData[C]]:
-    self_no_vjp = self.replace(vjp=None)
+    cache_op = self._cache_key_op()
     final_cache = {}
     if device_kind is None:
       device_kind = backend.get_default_device().device_kind
     if not config_lib.ignore_autotuning_cache.value:
-      if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
+      if (cache := _AUTOTUNING_CACHE.get(cache_op)) is None:
         cache = autotuning_cache.AutotuningCache(
-            self_no_vjp, paths=[autotuning_cache.CACHE_PATH]
+            cache_op, paths=[autotuning_cache.CACHE_PATH]
         )
-        _AUTOTUNING_CACHE[self_no_vjp] = cache
+        _AUTOTUNING_CACHE[cache_op] = cache
 
       final_cache = cache[device_kind]
-      logging.info("Loaded autotuning cache for %s", self_no_vjp)
+      logging.info("Loaded autotuning cache for %s", cache_op)
     else:
-      logging.warning("Ignoring autotuning cache for %s", self_no_vjp)
+      logging.warning("Ignoring autotuning cache for %s", cache_op)
 
     return final_cache
+
+  def _fusible_fwd(
+      self,
+      *args,
+      out_fusions: fuser_adapter.OutputFusion | None = None,
+      config: C,
+      **kwargs,
+  ) -> T:
+    """Fusible forward pass invoked inside `@op_fusion.fuse`."""
+    del args, out_fusions, config, kwargs
+    raise NotImplementedError(
+        f"{type(self).__name__} does not support kernel fusion"
+        " (@op_fusion.fuse)."
+    )
 
   @abc.abstractmethod
   def _fwd(self, *args, **kwargs) -> tuple[T, R | None]:
@@ -410,6 +471,12 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     return True
 
 
+def snake_case_name(op: type[Op] | Op) -> str:  # pylint: disable=g-bare-generic
+  """Returns the snake_case name of the op implementation."""
+  cls = op if isinstance(op, type) else type(op)
+  return _CAMEL_TO_SNAKE_PATTERN.sub(r"_\1", cls.__name__).lower()
+
+
 type AutotuningCache = dict[DeviceKind, dict[Any, AutotuningData[Any]]]
 
 _AUTOTUNING_CACHE: dict[Op, AutotuningCache] = {}  # pylint: disable=g-bare-generic
@@ -457,6 +524,15 @@ class BoundArguments[C, K: Hashable]:
   def vmap_axis_sizes(self) -> tuple[int, ...]:
     return batching.get_vmap_axis_sizes(dict(self.arguments))
 
+  def _tokamax_metadata(
+      self, config: C
+  ) -> contextlib.AbstractContextManager[None]:
+    json_op = self.op.replace(config=config, vjp=None)
+    json_ba = BoundArguments(json_op, _abstractify(dict(self.arguments)))
+    return _tokamax_metadata(
+        str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
+    )
+
   @property
   def default_config(self) -> C:
     """Returns the default config for the op.
@@ -464,17 +540,30 @@ class BoundArguments[C, K: Hashable]:
     The default config is determined as follows:
       1. If `op.config` is not `None`, return it.
       2. If `cached_autotuning_data` is not `None`, return the fastest config.
-      3. If the `tokamax_autotuning_cache_miss_fallback` config option is set to
-        'autotune', call `autotune` and return the fastest config.
-      4. If the `tokamax_autotuning_cache_miss_fallback` config option is set to
-        'heuristics', return `heuristics_config`.
-      5. Otherwise, i.e. the `tokamax_autotuning_cache_miss_fallback` config
-        option is set to 'error', an error will be raised.
+      3. If `op.autotuning_cache_miss_fallback` is not `None`, apply its
+         cache-miss fallback policy.
+      4. Otherwise, apply the `tokamax_autotuning_cache_miss_fallback` config
+         option.
+
+    Cache-miss fallback policies:
+      - 'autotune': call `autotune` and return the fastest config.
+      - 'heuristics': return `heuristics_config`.
+      - 'error': raise a `ValueError`.
 
     Returns:
       The default config for the op.
     """
-    cache_miss_fallback = config_lib.autotuning_cache_miss_fallback.value
+    cache_miss_fallback = (
+        self.op.autotuning_cache_miss_fallback
+        if self.op.autotuning_cache_miss_fallback is not None
+        else config_lib.autotuning_cache_miss_fallback.value
+    )
+    if cache_miss_fallback not in config_lib.AUTOTUNING_CACHE_MISS_FALLBACKS:
+      raise ValueError(
+          "Invalid `autotuning_cache_miss_fallback`:"
+          f" {cache_miss_fallback!r}. Expected one of"
+          f" {config_lib.AUTOTUNING_CACHE_MISS_FALLBACKS} or None."
+      )
     return self.get_config(
         autotune_configs=AUTO if cache_miss_fallback == "autotune" else None,
         allow_heuristics=cache_miss_fallback != "error",
@@ -512,14 +601,54 @@ class BoundArguments[C, K: Hashable]:
         return data.fastest_config
 
     if autotune_configs is not None:
-      return self.autotune(
+      device_kind = self._device_kind() if check_autotuning_cache else None
+      key = self.autotuning_cache_key if check_autotuning_cache else None
+      if check_autotuning_cache:
+        logging.warning(
+            "Falling back to online autotuning for %s on %s (key: %r)."
+            " Online autotuning should only be used in experimentation and not"
+            " in production, as it degrades start-up time and autotuning"
+            " results are not persisted.",
+            self.op,
+            device_kind,
+            key,
+        )
+      config = self.autotune(
           autotune_configs, cache_results=cache_autotuning_results
       ).fastest_config
+      if check_autotuning_cache:
+        logging.warning(
+            "Online autotuning completed for %s on %s; selected config: %s"
+            " (not persisted). Key: %r",
+            self.op,
+            device_kind,
+            config,
+            key,
+        )
+      return config
 
     if allow_heuristics:
+      if check_autotuning_cache:
+        logging.warning(
+            "Falling back to heuristics config (%s) for %s on %s; no matching"
+            " autotuning entry for key: %r",
+            heuristics_config,
+            self.op,
+            self._device_kind(),
+            self.autotuning_cache_key,
+        )
       return heuristics_config
 
-    raise ValueError(f"No config found for {self}.")
+    raise ValueError(
+        f"No config found for {self} (device={self._device_kind()},"
+        f" key={self.autotuning_cache_key!r})."
+    )
+
+  def _device_kind(self) -> DeviceKind:
+    device_kind = infer_device_kind(self)
+    if device_kind is None:
+      device_kind = backend.get_default_device().device_kind
+    return device_kind
 
   @property
   def heuristics_config(self) -> C:
@@ -534,21 +663,22 @@ class BoundArguments[C, K: Hashable]:
   @property
   def cached_autotuning_data(self) -> AutotuningData[C] | None:
     """Returns autotuning data from the cache, if available."""
-    if config_lib.ignore_autotuning_cache.value:
+    if (
+        config_lib.ignore_autotuning_cache.value
+    ):
       return None
 
-    device_kind = infer_device_kind(self)
-    if device_kind is None:
-      device_kind = backend.get_default_device().device_kind
+    device_kind = self._device_kind()
     key = self.autotuning_cache_key
 
+    cache_op = self.op._cache_key_op()  # pylint: disable=protected-access
     for overlay in reversed(AUTOTUNING_CACHE_OVERLAY_STACK.get()):
-      data = overlay.get(self.op, {}).get(device_kind, {}).get(key)
+      data = overlay.get(cache_op, {}).get(device_kind, {}).get(key)
       if data is not None:
         return data
 
     try:
-      return self.op.get_autotuning_cache()[key]
+      return self.op.get_autotuning_cache(device_kind)[key]
     except KeyError:
       key = cast(Mapping[str, Any], key)
       json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
@@ -670,7 +800,7 @@ class _AlwaysEqual:
 @functools.lru_cache
 def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
   spec = pydantic_lib.get_arg_spec_model(f"{type(op).__name__}Spec", op._fwd_signature)  # pylint: disable=protected-access
-  return pydantic_lib.get_adapter(spec)
+  return pydantic_lib.get_adapter(spec)  # pyrefly: ignore[bad-return]
 
 
 BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(BoundArguments)
@@ -692,6 +822,10 @@ def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
   """Infers the device kind from bound array arguments."""
   device_kinds = {d.device_kind for d in infer_devices(ba)}
   if not device_kinds:
+    # Fall back to active abstract mesh during export or cross-compilation.
+    abstract_mesh = jax.sharding.get_abstract_mesh()
+    if abstract_mesh.abstract_device is not None:
+      return abstract_mesh.abstract_device.device_kind
     return None
   if len(device_kinds) == 1:
     return device_kinds.pop()

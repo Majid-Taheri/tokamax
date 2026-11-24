@@ -48,7 +48,8 @@ def get_heuristics_config(ba: op.BoundArguments) -> common.Config:
 
 
 def get_autotuning_configs(ba: op.BoundArguments) -> set[common.Config]:
-  lhs, rhs, _ = ba.args
+  """Returns autotuning configs for SM80."""
+  lhs, rhs = ba.args
   _, k = lhs.shape
   n = rhs.shape[-1]
 
@@ -194,7 +195,7 @@ def ragged_dot_kernel(
         # back only this tile's valid rows one row at a time, so a tile
         # straddling a group boundary never clobbers the neighbouring group's
         # rows.
-        out_smem[...] = acc.astype(out_smem.dtype)
+        tk_mgpu.store(out_smem, acc.astype(out_smem.dtype), optimized=False)
 
         @pl.loop(0, actual_size)
         def _store_row(r):

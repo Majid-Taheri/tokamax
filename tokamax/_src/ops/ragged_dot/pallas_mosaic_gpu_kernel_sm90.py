@@ -14,7 +14,6 @@
 # ==============================================================================
 """Ragged dot Pallas-Mosaic-GPU Non-Quantized Kernel."""
 import functools
-import math
 
 import jax
 from jax.experimental import pallas as pl
@@ -115,24 +114,15 @@ def ragged_dot_kernel(
           o_smem[...] = acc_.astype(o_smem.dtype)
           plgpu.commit_smem()
 
-          smem_start = start_within_block
-          remaining_rows = min(block_m, m)
-          while remaining_rows > 0:
-            const_rows_len = 1 << int(math.log2(remaining_rows))
-            remaining_rows //= 2
-
-            @pl.when(actual_size & const_rows_len != 0)
-            def _():
-              o_smem_ = o_smem.at[pl.ds(smem_start, const_rows_len)]
-              o_gmem_ = o_gmem.at[
-                  pl.ds(block_start + smem_start, const_rows_len),
-                  pl.ds(ni * block_n, block_n),
-              ]
-              plgpu.copy_smem_to_gmem(o_smem_, o_gmem_, commit_group=False)
-
-            smem_start += actual_size & const_rows_len
-          plgpu.commit_smem_to_gmem_group()
-          plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+          common.copy_ragged_smem_to_gmem(
+              o_smem,
+              o_gmem,
+              block_start=block_start,
+              start_within_block=start_within_block,
+              actual_size=actual_size,
+              ns=pl.ds(ni * block_n, block_n),
+              max_rows=min(block_m, m),
+          )
 
     if config.persistent:
       # We stratify the grid: first emit a number of blocks that have definitely
@@ -200,8 +190,8 @@ def _ragged_contracting_dim_dot_kernel_body(
   group_start = group_sizes_starts_gmem[gi]
   group_end = group_start + group_sizes_gmem[gi]
 
-  lb = jax.lax.div(group_start.astype(jnp.int32), block_k)
-  ub = pl.cdiv(group_end.astype(jnp.int32), block_k)
+  lb = mgpu_lib.udiv(group_start.astype(jnp.int32), block_k)
+  ub = mgpu_lib.ucdiv(group_end.astype(jnp.int32), block_k)
 
   def acc_scope(acc):
     def body(idxs, lhs_smem, rhs_smem):
@@ -264,10 +254,6 @@ def ragged_contracting_dim_dot_kernel(
       config=config,
       activation=activation,
   )
-  if jax.__version_info__ >= (0, 11, 0):
-    lowering_semantics = plgpu.LoweringSemantics.Warpgroup
-  else:
-    lowering_semantics = plgpu.LoweringSemantics.Lane
 
   kernel = plgpu.kernel(
       body,
@@ -276,7 +262,7 @@ def ragged_contracting_dim_dot_kernel(
       grid_names=("m", "n", "g"),
       kernel_name="ragged_contracting_dim_dot_sm90",
       compiler_params=plgpu.CompilerParams(
-          lowering_semantics=lowering_semantics
+          lowering_semantics=plgpu.LoweringSemantics.Warpgroup
       )
   )
 

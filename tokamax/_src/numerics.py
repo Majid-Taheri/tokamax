@@ -15,9 +15,10 @@
 """Utilities for numerics."""
 
 import abc
+from collections.abc import Callable
 from concurrent import futures
 import dataclasses
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -25,7 +26,6 @@ import numpy as np
 import qwix
 from tokamax._src import batching
 from tokamax._src import utils
-
 
 type PyTree = Any
 
@@ -131,6 +131,9 @@ def array_numeric_summary(x: jax.Array) -> NumericSummary:
 class ArrayInitializer(abc.ABC):
   """A callable that returns an array."""
 
+  sharding: jax.sharding.Sharding | None = None
+  format: Any = None
+
   @abc.abstractmethod
   def __call__(self, rng: np.random.Generator) -> np.ndarray | jax.Array:
     ...
@@ -145,19 +148,88 @@ class ArrayInitializer(abc.ABC):
   def dtype(self) -> jnp.dtype:
     ...
 
+  def with_sharding(
+      self, sharding: jax.sharding.Sharding
+  ) -> 'ArrayInitializer':
+    """Returns a copy of this initializer with the given sharding."""
+    raise NotImplementedError(
+        f'{type(self).__name__} must implement with_sharding to be used with a'
+        ' sharded abstract mesh.'
+    )
+
 
 class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
-  """A abstract array with a known range."""
+  """An abstract integer array with a known `[minval, maxval)` range."""
 
   def __init__(self, shape, dtype, minval, maxval):
     jax.ShapeDtypeStruct.__init__(self, shape, dtype)
     self.minval = minval
     self.maxval = maxval
 
-  def __call__(self, rng: np.random.Generator) -> np.ndarray:
+  def __call__(self, rng: np.random.Generator) -> np.ndarray | jax.Array:
+    i32 = np.iinfo(np.int32)
+    if (
+        self.size >= _DEVICE_INIT_THRESHOLD
+        and i32.min <= self.minval
+        and self.maxval <= i32.max
+    ):
+      return _run_on_device(
+          rng,
+          lambda k: _int_initializer(
+              k, self.shape, self.dtype, self.minval, self.maxval
+          ),
+      )
     return _int_initializer(
         rng, self.shape, self.dtype, self.minval, self.maxval
     )
+
+
+class FloatRangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
+  """An abstract float array initialized uniformly in `[minval, maxval)`."""
+
+  def __init__(self, shape, dtype, minval: float, maxval: float):
+    jax.ShapeDtypeStruct.__init__(self, shape, dtype)
+    self.minval = minval
+    self.maxval = maxval
+
+  def __call__(self, rng: np.random.Generator) -> np.ndarray | jax.Array:
+    if self.size >= _DEVICE_INIT_THRESHOLD:
+      return _run_on_device(
+          rng,
+          lambda k: jax.random.uniform(
+              k,
+              self.shape,
+              dtype=_promote_float_dtype(jnp.dtype(self.dtype)),
+              minval=self.minval,
+              maxval=self.maxval,
+          ).astype(self.dtype),
+      )
+    return rng.uniform(self.minval, self.maxval, self.shape).astype(self.dtype)
+
+
+# Threshold (in number of elements) above which arrays are initialized directly
+# on device via `jax.jit` + `jax.random` instead of on the host with NumPy.
+# Small arrays stay on the host path to avoid per-shape XLA compile overhead
+# across parameterized unit tests.
+_DEVICE_INIT_THRESHOLD = 1024 * 1024
+
+
+def _promote_float_dtype(dtype: jnp.dtype) -> jnp.dtype:
+  try:
+    return jnp.promote_types(dtype, jnp.float32)
+  except jax.dtypes.TypePromotionError:
+    return jnp.dtype(jnp.float32)
+
+
+def _run_on_device(
+    rng: np.random.Generator,
+    init_fn: Callable[[jax.Array], jax.Array],
+    out_sharding: Any = None,
+) -> jax.Array:
+  seed = jnp.int32(rng.integers(0, 2**31))
+  return jax.jit(
+      lambda s: init_fn(jax.random.key(s)), out_shardings=out_sharding
+  )(seed)
 
 
 def _int_initializer(rng, shape, dtype, minval=None, maxval=None):
@@ -167,13 +239,125 @@ def _int_initializer(rng, shape, dtype, minval=None, maxval=None):
     maxval = min(iinfo.max + 1, 128)
   if minval is None:
     minval = max(iinfo.min, -maxval)
-  return rng.integers(minval, maxval, shape).astype(dtype)
+  if isinstance(rng, np.random.Generator):
+    return rng.integers(minval, maxval, shape).astype(dtype)
+  return jax.random.randint(rng, shape, minval, maxval).astype(dtype)
 
 
 def _as_vmap_shape(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
   if isinstance(x, batching.BatchedShapeDtype):
     return jax.ShapeDtypeStruct(x.vmap_shape, x.dtype)
   return x
+
+
+def _init_array(
+    rng: np.random.Generator, x: jax.ShapeDtypeStruct
+) -> jax.Array:
+  """Initializes a `ShapeDtypeStruct` on host (small) or device (large)."""
+  x = _as_vmap_shape(x)
+  dtype = jnp.dtype(x.dtype)
+  try:
+    sharding = x.sharding
+  except AttributeError:
+    sharding = None
+  if sharding is None:
+    out_sharding = None
+  else:
+    try:
+      out_sharding = x.format
+    except AttributeError:
+      out_sharding = None
+
+  if jnp.issubdtype(dtype, jnp.floating):
+    dtype_ = _promote_float_dtype(dtype)
+    init_host = lambda: rng.standard_normal(size=x.shape, dtype=dtype_).astype(
+        dtype
+    )
+    init_dev = lambda k: jax.random.normal(k, x.shape, dtype=dtype_).astype(
+        dtype
+    )
+  elif dtype.name == 'bool':
+    init_host = lambda: rng.binomial(n=1, p=0.5, size=x.shape).astype(dtype)
+    init_dev = lambda k: jax.random.bernoulli(k, 0.5, x.shape)
+  elif 'int' in dtype.name:
+    init_host = lambda: _int_initializer(rng, x.shape, dtype)
+    init_dev = lambda k: _int_initializer(k, x.shape, dtype)
+  else:
+    raise NotImplementedError(f'dtype {dtype.name} not supported.')
+
+  if x.size >= _DEVICE_INIT_THRESHOLD:
+    return _run_on_device(rng, init_dev, out_sharding=out_sharding)
+  # TODO: Can we consolidate `device_put` into a single call?
+  return jax.device_put(init_host(), out_sharding)
+
+
+def _is_tree_leaf(leaf: Any) -> bool:
+  return isinstance(leaf, (ArrayInitializer, qwix.QArray))
+
+
+def _is_abstract_leaf(leaf: Any) -> bool:
+  """Returns True if leaf is an abstract array or initializer."""
+  if isinstance(leaf, (jax.ShapeDtypeStruct, ArrayInitializer)):
+    return True
+  if isinstance(leaf, qwix.QArray):
+    return isinstance(leaf.qvalue, jax.ShapeDtypeStruct) or isinstance(
+        leaf.scale, jax.ShapeDtypeStruct
+    )
+  return False
+
+
+def _init_qarray(rng: np.random.Generator, qarray: qwix.QArray) -> qwix.QArray:
+  """Initializes an abstract QArray."""
+  if qarray.zero_point is not None:
+    raise NotImplementedError('Zero point not supported.')
+  if qarray.qvalue.dtype != qarray.qtype:
+    raise NotImplementedError('`qvalue.dtype` and `qtype` must match.')
+
+  abstract_qvalue = isinstance(qarray.qvalue, jax.ShapeDtypeStruct)
+  abstract_scale = isinstance(qarray.scale, jax.ShapeDtypeStruct)
+
+  if not abstract_qvalue and not abstract_scale:
+    return qarray
+  if not (abstract_qvalue and abstract_scale):
+    raise ValueError(
+        '`QArray` values and scales must both be abstract or both concrete.'
+    )
+
+  qvalue_struct = cast(jax.ShapeDtypeStruct, qarray.qvalue)
+  scale_struct = cast(jax.ShapeDtypeStruct, qarray.scale)
+  vmap_qvalue: Any = _as_vmap_shape(qvalue_struct)
+  vmap_scale: Any = _as_vmap_shape(scale_struct)
+
+  updated_qarray = dataclasses.replace(
+      qarray,
+      qvalue=vmap_qvalue,
+      scale=vmap_scale,
+  )
+  values = _init_array(
+      rng, jax.ShapeDtypeStruct(updated_qarray.shape, updated_qarray.dtype)
+  )
+  tiled_axes = {i: dim for i, dim in enumerate(updated_qarray.scale_tile_shape)}
+  return qwix.quantize(values, updated_qarray.qtype, tiled_axes=tiled_axes)
+
+
+def _init_leaf(rng: np.random.Generator, leaf: Any) -> Any:
+  """Initializes a single abstract array leaf with layout and sharding."""
+  if isinstance(leaf, ArrayInitializer):
+    leaf_dict = vars(leaf)
+    sharding = leaf_dict.get('sharding', None)
+    out_sharding = (
+        leaf_dict.get('format', sharding) if sharding is not None else None
+    )
+    arr = leaf(rng)
+    if isinstance(arr, jax.Array) and out_sharding is None:
+      return arr
+    return jax.device_put(arr, out_sharding)
+
+  if isinstance(leaf, qwix.QArray):
+    return _init_qarray(rng, leaf)
+
+  assert isinstance(leaf, jax.ShapeDtypeStruct)
+  return _init_array(rng, leaf)
 
 
 def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
@@ -191,74 +375,17 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     A new PyTree with each abstract array replaced by a randomly initialized
     `jax.Array`.
   """
-
-  def init_with_layout(rng, x):
-    if isinstance(x, ArrayInitializer):
-      return jax.device_put(x(rng))
-    if isinstance(x, qwix.QArray):
-      if x.zero_point is not None:
-        raise NotImplementedError('Zero point not supported.')
-      if x.qvalue.dtype != x.qtype:
-        raise NotImplementedError('`qvalue.dtype` and `qtype` must match.')
-
-      abstract_qvalue = isinstance(x.qvalue, jax.ShapeDtypeStruct)
-      abstract_scale = isinstance(x.scale, jax.ShapeDtypeStruct)
-
-      if abstract_qvalue and abstract_scale:
-        x = dataclasses.replace(
-            x, qvalue=_as_vmap_shape(x.qvalue), scale=_as_vmap_shape(x.scale)  # pyrefly: ignore[bad-argument-type]
-        )
-        try:
-          dtype_ = jnp.promote_types(x.dtype, jnp.float32)
-        except jax.dtypes.TypePromotionError:
-          dtype_ = jnp.float32
-        values = rng.standard_normal(size=x.shape, dtype=dtype_).astype(x.dtype)
-        tiled_axes = {i: d for i, d in enumerate(x.scale_tile_shape)}
-        return qwix.quantize(values, x.qtype, tiled_axes=tiled_axes)
-      elif not abstract_qvalue and not abstract_scale:
-        return x
-      else:
-        raise ValueError(
-            '`QArray` values and scales must both be abstract or both concrete.'
-        )
-    assert isinstance(x, jax.ShapeDtypeStruct)
-
-    x = _as_vmap_shape(x)
-    dtype = jnp.dtype(x.dtype)
-
-    if jnp.issubdtype(dtype, jnp.floating):
-      try:
-        dtype_ = jnp.promote_types(dtype, jnp.float32)
-      except jax.dtypes.TypePromotionError:
-        dtype_ = jnp.float32
-      y = rng.standard_normal(size=x.shape, dtype=dtype_).astype(dtype)
-    elif dtype.name == 'bool':
-      y = rng.binomial(n=1, p=0.5, size=x.shape).astype(dtype)
-    elif 'int' in dtype.name:
-      y = _int_initializer(rng, x.shape, dtype)
-    else:
-      raise NotImplementedError(f'dtype {dtype.name} not supported.')
-
-    sharding = getattr(x, 'sharding', None)
-    # TODO: Can we consolidate `device_put` into a single call?
-    return jax.device_put(y, None if sharding is None else x.format)
-
-  is_leaf = lambda x: isinstance(x, (ArrayInitializer, qwix.QArray))
-  x_flat, tree = jax.tree.flatten(x, is_leaf=is_leaf)
-
-  def is_abstract(x):
-    return isinstance(x, (jax.ShapeDtypeStruct, ArrayInitializer)) or (
-        isinstance(x, qwix.QArray)
-        and (
-            isinstance(x.qvalue, jax.ShapeDtypeStruct)
-            or isinstance(x.scale, jax.ShapeDtypeStruct)
-        )
-    )
-
-  abstract_arrays, other, merge = utils.split_merge(is_abstract, x_flat)
+  x_flat, tree = jax.tree.flatten(x, is_leaf=_is_tree_leaf)
+  abstract_arrays, other, merge = utils.split_merge(_is_abstract_leaf, x_flat)
   rngs = np.random.default_rng(seed).spawn(len(abstract_arrays))
 
-  with futures.ThreadPoolExecutor() as executor:
-    arrays = list(executor.map(init_with_layout, rngs, abstract_arrays))
+  if jax.process_count() > 1:
+    # Initializing arrays sharded across processes launches a program on every
+    # process. These must be launched in the same order on all processes, so we
+    # can't initialize concurrently.
+    arrays = list(map(_init_leaf, rngs, abstract_arrays))
+  else:
+    with futures.ThreadPoolExecutor() as executor:
+      arrays = list(executor.map(_init_leaf, rngs, abstract_arrays))
 
   return tree.unflatten(merge(arrays, other))

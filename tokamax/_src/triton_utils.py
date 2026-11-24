@@ -1,0 +1,401 @@
+# Copyright 2026 DeepMind Technologies Limited. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Triton utilities."""
+
+from collections.abc import Callable
+import functools
+import math
+
+import jax
+from jax.extend import backend
+import jax.numpy as jnp
+from tokamax._src import precision as precision_lib
+import triton
+import triton.language as tl
+from triton.language.extra.cuda import libdevice
+
+
+def vmap_kernel(launch_fn, batch_shape=(), batched=()):
+  """Wraps a kernel launch to support (nested) `jax.vmap`.
+
+  `launch_fn(batch_shape, batch_strides, *args)` must return outputs with
+  leading `batch_shape` dims. `batched[i][j]` is whether arg `j` is batched
+  along `batch_shape[i]`; unbatched args get a zero batch stride.
+  """
+
+  @jax.custom_batching.custom_vmap
+  def f(*args):
+    strides = []
+    for i, x in enumerate(args):
+      x_strides = (
+          iter(())
+          if x is None
+          else (math.prod(x.shape[d + 1 :]) for d in range(x.ndim))
+      )
+      strides.append(tuple(next(x_strides) if b[i] else 0 for b in batched))
+    return launch_fn(batch_shape, tuple(strides), *args)
+
+  @f.def_vmap
+  def _(axis_size, in_batched, *args):
+    out = vmap_kernel(
+        launch_fn, (axis_size, *batch_shape), (in_batched, *batched)
+    )(*args)
+    return out, jax.tree.map(lambda _: True, out)
+
+  return f
+
+
+@triton.jit
+def batch_offset(pid_b, batch_shape, batch_strides):
+  """Unravels `pid_b` over `batch_shape` and dots with `batch_strides`."""
+  offset = tl.full((), 0, tl.int64)
+  pid_b = pid_b + offset
+  for i in tl.static_range(len(batch_shape) - 1, 0, -1):
+    offset += (pid_b % batch_shape[i]) * batch_strides[i]
+    pid_b //= batch_shape[i]
+  return offset if batch_shape == () else offset + pid_b * batch_strides[0]
+
+
+@triton.jit
+def _get_grid_pids_m(
+    pid,
+    grid_m: tl.constexpr,
+    grid_n: tl.constexpr,
+    group_size: tl.constexpr,
+):
+  num_progs_in_group: tl.constexpr = group_size * grid_n
+  group_start_m = (pid // num_progs_in_group) * group_size
+  cur_group_size = tl.minimum(grid_m - group_start_m, group_size)
+  pid_m = group_start_m + (pid % cur_group_size)
+  pid_n = (pid % num_progs_in_group) // cur_group_size
+  return pid_m, pid_n
+
+
+@triton.jit
+def _get_grid_pids_n(
+    pid,
+    grid_m: tl.constexpr,
+    grid_n: tl.constexpr,
+    group_size: tl.constexpr,
+):
+  pid_n, pid_m = _get_grid_pids_m(pid, grid_n, grid_m, group_size)
+  return pid_m, pid_n
+
+
+def _num_sms() -> int:
+  return getattr(backend.get_default_device(), 'core_count', 1)
+
+
+def _get_group_size_cost(
+    group_size_m: int,
+    grid_m: int,
+    grid_n: int,
+    block_m_cost: int,
+    block_n_cost: int,
+) -> int:
+  """Returns the total cost for the given group size."""
+  num_live_groups = triton.cdiv(_num_sms(), group_size_m)
+  num_live_blocks_m = triton.cdiv(num_live_groups, grid_n) * group_size_m
+  num_live_blocks_m = min(num_live_blocks_m, grid_m)
+  num_live_blocks_n = min(num_live_groups, grid_n)
+  return num_live_blocks_m * block_m_cost + num_live_blocks_n * block_n_cost
+
+
+def get_cheapest_grid_grouping(
+    *,
+    grid_m: int,
+    grid_n: int,
+    block_m_cost: int,
+    block_n_cost: int,
+) -> tuple[int, bool]:
+  """Returns (group_size, group_by_m) that minimizes total cache cost."""
+  num_live_progs = _num_sms()
+
+  def group_size_m_usage(group_size_m):
+    return _get_group_size_cost(
+        group_size_m, grid_m, grid_n, block_m_cost, block_n_cost
+    )
+
+  group_size_m = min(
+      range(1, min(num_live_progs, grid_m) + 1), key=group_size_m_usage
+  )
+
+  def group_size_n_usage(group_size_n):
+    return _get_group_size_cost(
+        group_size_n, grid_n, grid_m, block_n_cost, block_m_cost
+    )
+
+  group_size_n = min(
+      range(1, min(num_live_progs, grid_n) + 1), key=group_size_n_usage
+  )
+
+  if group_size_m_usage(group_size_m) <= group_size_n_usage(group_size_n):
+    return group_size_m, True
+  return group_size_n, False
+
+
+def get_cheapest_grid_pids(
+    *,
+    grid_m: int,
+    grid_n: int,
+    block_m_cost: int,
+    block_n_cost: int,
+) -> tuple[int, triton.runtime.jit.JITFunction]:
+  """Returns (group_size, get_pids_fn) that minimizes total cache cost."""
+  group_size, group_by_m = get_cheapest_grid_grouping(
+      grid_m=grid_m,
+      grid_n=grid_n,
+      block_m_cost=block_m_cost,
+      block_n_cost=block_n_cost,
+  )
+  return group_size, (_get_grid_pids_m if group_by_m else _get_grid_pids_n)
+
+
+@triton.jit
+def _swish(x):
+  return x * tl.sigmoid(x)
+
+
+@triton.jit
+def _relu(x):
+  return tl.maximum(x, 0.0)
+
+
+@triton.jit
+def _gelu_approx(x):
+  return 0.5 * x * (1.0 + libdevice.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+
+
+@triton.jit
+def _gelu_exact(x):
+  return 0.5 * x * libdevice.erfc(-0.7071067811865475 * x)
+
+
+def get_triton_activation(
+    activation: Callable[[jax.Array], jax.Array] | None,
+) -> Callable[..., tl.tensor] | None:
+  """Returns the Triton device function corresponding to a JAX activation."""
+  if activation is None or activation == jax.nn.identity:
+    return None
+  if isinstance(activation, triton.runtime.jit.JITFunction):
+    return activation
+  if activation in (jax.nn.swish, jax.nn.silu):
+    return _swish
+  if activation == jax.nn.sigmoid:
+    return tl.sigmoid
+  if activation == jax.nn.tanh:
+    return libdevice.tanh
+  if activation == jax.nn.relu:
+    return _relu
+  if activation == jax.nn.gelu:
+    return _gelu_approx
+  if (
+      isinstance(activation, functools.partial)
+      and activation.func == jax.nn.gelu
+      and not activation.args
+      and set(activation.keywords) <= {'approximate'}
+  ):
+    return (
+        _gelu_approx
+        if activation.keywords.get('approximate', True)
+        else _gelu_exact
+    )
+  raise NotImplementedError(
+      f'Unsupported activation for Triton kernel: {activation}'
+  )
+
+
+_JNP_TO_TL_DTYPES = {
+    jnp.bool_: tl.int1,
+    jnp.int8: tl.int8,
+    jnp.int16: tl.int16,
+    jnp.int32: tl.int32,
+    jnp.int64: tl.int64,
+    jnp.uint8: tl.uint8,
+    jnp.uint16: tl.uint16,
+    jnp.uint32: tl.uint32,
+    jnp.uint64: tl.uint64,
+    jnp.float8_e4m3fn: tl.float8e4nv,
+    jnp.float8_e5m2: tl.float8e5,
+    jnp.float16: tl.float16,
+    jnp.bfloat16: tl.bfloat16,
+    jnp.float32: tl.float32,
+    jnp.float64: tl.float64,
+}
+
+
+def jnp_to_tl_dtype(dtype: jax.typing.DTypeLike) -> tl.dtype:
+  """Returns the Triton dtype corresponding to a JAX dtype."""
+  return _JNP_TO_TL_DTYPES[jnp.dtype(dtype).type]
+
+
+_SUPPORTED_TRITON_PRESETS = frozenset({
+    jax.lax.DotAlgorithmPreset.DEFAULT,
+    jax.lax.DotAlgorithmPreset.F16_F16_F32,
+    jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+    jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
+    jax.lax.DotAlgorithmPreset.TF32_TF32_F32,
+    jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3,
+    jax.lax.DotAlgorithmPreset.F32_F32_F32,
+})
+
+
+def get_input_precision(
+    precision: precision_lib.CanonicalPrecision, dtype: jnp.dtype
+) -> str | None:
+  """Returns the Triton `tl.dot` `input_precision` string for a given precision."""
+  if isinstance(precision, jax.lax.DotAlgorithm):
+    raise NotImplementedError('`DotAlgorithm` is not supported by Triton.')
+  if (
+      isinstance(precision, jax.lax.DotAlgorithmPreset)
+      and precision not in _SUPPORTED_TRITON_PRESETS
+  ):
+    raise NotImplementedError(
+        f'Unsupported precision for Triton kernel: {precision}'
+    )
+  if dtype != jnp.float32:
+    return None
+  if isinstance(precision, tuple):
+    if jax.lax.Precision.HIGHEST in precision:
+      return 'ieee'
+    return 'tf32'
+  if isinstance(precision, jax.lax.DotAlgorithmPreset):
+    match precision:
+      case (
+          jax.lax.DotAlgorithmPreset.DEFAULT
+          | jax.lax.DotAlgorithmPreset.TF32_TF32_F32
+      ):
+        return 'tf32'
+      case jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3:
+        return 'tf32x3'
+      case jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3:
+        return 'bf16x3'
+      case jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6:
+        return 'bf16x6'
+      case jax.lax.DotAlgorithmPreset.F32_F32_F32:
+        return 'ieee'
+      case _:
+        raise NotImplementedError(
+            f'Unsupported precision for Triton kernel: {precision}'
+        )
+  return 'tf32'
+
+
+def get_dot_dtype_and_precision(
+    precision: precision_lib.CanonicalPrecision,
+    lhs_dtype: jax.typing.DTypeLike,
+    rhs_dtype: jax.typing.DTypeLike,
+) -> tuple[tl.dtype, str | None]:
+  """Returns the Triton dot operand dtype and `input_precision` string."""
+  if (
+      isinstance(precision, jax.lax.DotAlgorithmPreset)
+      and precision.supported_lhs_types is not None
+  ):
+    dot_jnp_dtype = jnp.dtype(precision.supported_lhs_types[0])
+  else:
+    dot_jnp_dtype = jnp.dtype(jnp.result_type(lhs_dtype, rhs_dtype))
+  input_precision = get_input_precision(precision, dot_jnp_dtype)
+  return jnp_to_tl_dtype(dot_jnp_dtype), input_precision
+
+
+@triton.jit
+def _round_f32_to_tf32(x):
+  return tl.inline_asm_elementwise(
+      'cvt.rna.tf32.f32 $0, $1;',
+      '=r,r',
+      [x],
+      dtype=tl.float32,
+      is_pure=True,
+      pack=1,
+  )
+
+
+@triton.jit
+def dot(a, b, acc=None, input_precision=None):
+  """Computes `tl.dot`, rounding `float32` operands to TF32."""
+  if input_precision == 'tf32':
+    if a.dtype == tl.float32:
+      a = _round_f32_to_tf32(a)
+    if b.dtype == tl.float32:
+      b = _round_f32_to_tf32(b)
+  return tl.dot(a, b, acc=acc, input_precision=input_precision)
+
+
+@triton.jit
+def advance_bcast_ptr(
+    ptr, pid_b, batch_shape, batch_strides, pid_h, num_heads, shape
+):
+  """Advances `ptr` to the `(pid_b, pid_h)` slice of a broadcastable array.
+
+  `shape` is the per-batch shape, whose leading (head) dim is either `1` or a
+  divisor of `num_heads`.
+  """
+  ptr += batch_offset(pid_b, batch_shape, batch_strides)
+  if shape[0] != 1:
+    stride: tl.constexpr = shape[1] if len(shape) == 2 else shape[1] * shape[2]
+    ptr += pid_h // (num_heads // shape[0]) * stride
+  return ptr
+
+
+@triton.jit
+def row_offset(offs_r, bound_r, stride_r):
+  """Returns `offs_r[:, None] * stride_r`, using int64 only if needed."""
+  if (bound_r + offs_r.shape[0]) * stride_r >= 2**31:
+    return offs_r[:, None].to(tl.int64) * stride_r
+  else:
+    return offs_r[:, None] * stride_r
+
+
+@triton.jit
+def mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c):
+  """Returns the in-bounds mask for a 2D block, or `None` if not needed."""
+  if check_r and check_c:
+    return (offs_r[:, None] < bound_r) & (offs_c[None, :] < bound_c)
+  elif check_r:
+    return offs_r[:, None] < bound_r
+  elif check_c:
+    return offs_c[None, :] < bound_c
+  else:
+    return None
+
+
+@triton.jit
+def load_1d_bcast(ptr, offs, shape, other=0):
+  """Loads a block from the trailing (broadcastable) dim of `shape`."""
+  bound: tl.constexpr = shape[1]
+  block: tl.constexpr = offs.shape[0]
+  if bound == 1:
+    offs = tl.zeros((1,), dtype=tl.int32)
+  check: tl.constexpr = bound > 1 and bound % block != 0
+  mask = offs < bound if check else None
+  return tl.load(ptr + offs, mask=mask, other=None if mask is None else other)
+
+
+@triton.jit
+def load_2d_bcast(ptr, offs_r, offs_c, shape, other=0.0):
+  """Loads a block from the trailing two (broadcastable) dims of `shape`."""
+  bound_r: tl.constexpr = shape[1]
+  bound_c: tl.constexpr = shape[2]
+  block_r: tl.constexpr = offs_r.shape[0]
+  block_c: tl.constexpr = offs_c.shape[0]
+  # Broadcast dims still get a size-1 axis, so callers can transpose the block.
+  zero = tl.zeros((1, 1), dtype=tl.int32)
+  r = zero if bound_r == 1 else row_offset(offs_r, bound_r, bound_c)
+  c = zero if bound_c == 1 else offs_c[None, :]
+  check_r: tl.constexpr = bound_r > 1 and bound_r % block_r != 0
+  check_c: tl.constexpr = bound_c > 1 and bound_c % block_c != 0
+  mask = mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c)
+  return tl.load(ptr + r + c, mask=mask, other=None if mask is None else other)

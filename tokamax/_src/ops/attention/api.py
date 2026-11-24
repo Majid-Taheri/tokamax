@@ -19,9 +19,9 @@ from typing import Any, Final, Literal
 import immutabledict
 import jax
 from jax.extend import backend
-import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
+from tokamax._src import jaxtyping
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import xla_chunked
@@ -44,9 +44,9 @@ _IMPLEMENTATIONS = dict(
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.attention import pallas_triton as pl_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.attention import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  _IMPLEMENTATIONS["triton"] = pl_triton.PallasTritonFlashAttention()
+  _IMPLEMENTATIONS["triton"] = triton.TritonFlashAttention()
   _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
@@ -78,6 +78,7 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
 del _IMPLEMENTATIONS
 
 
+@jaxtyping.jaxtyped
 def dot_product_attention(
     query: Float[Array | QArray, "*B T N H"],
     key: Float[Array | QArray, "*B S K H"],
@@ -138,9 +139,9 @@ def dot_product_attention(
     raise ValueError("`implementation` must not be an empty sequence.")
 
   if query_seq_lengths is not None:
-    query_seq_lengths = query_seq_lengths[:, None, None]
+    query_seq_lengths = query_seq_lengths[..., None, None]
   if key_value_seq_lengths is not None:
-    key_value_seq_lengths = key_value_seq_lengths[:, None, None]
+    key_value_seq_lengths = key_value_seq_lengths[..., None, None]
 
   mask_ = base.Mask(
       mask,
@@ -153,9 +154,8 @@ def dot_product_attention(
     local_window_size = (local_window_size, local_window_size)
 
   if local_window_size is not None:
-    k_indices = jnp.arange(key.shape[-3])
     pre, post = local_window_size
-    mask_ &= base.Mask(k_start=k_indices - pre, k_end=k_indices + (post + 1))
+    mask_ &= base.CausalMask(offset=post, window_size=post + pre + 1)
 
   errors = []
   for impl in implementation:

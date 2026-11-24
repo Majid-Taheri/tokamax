@@ -24,7 +24,6 @@ import jax.numpy as jnp
 import numpy as np
 import pydantic
 import qwix
-from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
@@ -43,7 +42,7 @@ InputBufferCount = pydantic.PositiveInt
 
 QArray = base.QArray
 AsQArray = base.AsQArray
-Residuals = None
+Residuals = base.Residuals
 
 
 def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
@@ -52,6 +51,17 @@ def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
   iota, inc = jnp.arange(m), jnp.arange(gs.size)
   mask = (iota[None, :] >= s[:, None]) & (iota[None, :] < e[:, None])
   return jnp.sum(inc[:, None] * mask, axis=0)
+
+
+def _scoped_vmem_capacity_bytes() -> int:
+  """Returns XLA's default per-core scoped VMEM capacity for the current TPU."""
+  tpu_info = pltpu.get_tpu_info()
+  if tpu_info.chip_version == pltpu.ChipVersion.TPU_V5E:
+    # v5e has 128 MiB/core, but defaults to 16 MiB scoped VMEM like v5p.
+    return tpu_info.vmem_capacity_bytes // 8
+  if tpu_info.generation in (5, 6):
+    return tpu_info.vmem_capacity_bytes // 4
+  return tpu_info.vmem_capacity_bytes // 2
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -130,31 +140,17 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       activation: base.ActivationFunction | None = None,
       manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
-      rhs_scale: jax.Array | None = None,
-      rhs_bias: jax.Array | None = None,
-      maybe_quantize_lhs: bool = False,
-      lhs_scale: jax.Array | None = None,
-      zero_initialize: bool = True,
+      zero_initialize: bool = False,
       fuse_gateup_activation: str | None = None,
-      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-  ) -> tuple[jax.Array, base.Residuals]:
+  ) -> tuple[jax.Array, Residuals]:
     if (
         group_offset is not None
-        or rhs_scale is not None
-        or rhs_bias is not None
-        or maybe_quantize_lhs
-        or lhs_scale is not None
-        or not zero_initialize
+        or zero_initialize
         or fuse_gateup_activation is not None
-        or lhs_quantization_dtype is not None
-        or rhs_quantization_dtype is not None
     ):
       raise NotImplementedError(
           "The Pallas-Mosaic-TPU-v1 implementation does not support"
-          " group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
-          " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
-          " or rhs_quantization_dtype."
+          " group_offset, zero_initialize, or fuse_gateup_activation."
       )
 
     # TODO: Support more ragged_dot_dimension_numbers
@@ -169,21 +165,18 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           f"RaggedDot inputs must be >= 128, but {lhs.shape=}, {rhs.shape=}"
       )
 
+    if isinstance(group_sizes, base.GroupSizes):
+      group_sizes = jnp.array(group_sizes)
+
+    if preferred_element_type is None:
+      preferred_element_type = jnp.result_type(lhs, rhs)
+
     def maybe_quantize(x, tile_shape):
       if isinstance(x, QArray) or self.qdtype is None:
         return x
       tiled_axes = {i: d for i, d in enumerate(tile_shape)}
       return qwix.quantize(x, self.qdtype, tiled_axes=tiled_axes)
 
-    if isinstance(group_sizes, base.GroupSizes):
-      group_sizes = jnp.array(group_sizes)
-
-    if preferred_element_type is None:
-      preferred_element_type = (
-          precision_lib.default_output_dtype_from_input_dtypes(
-              lhs.dtype, rhs.dtype
-          )
-      )
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
       # STRATEGY 1: full-channel quantization along the reduction dimension
       lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
@@ -301,30 +294,44 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     # To account for accumulation buffer and prefetch, otherwise we see OOM
     # errors.
     total_size += 3 * output_tile_size
+    return bool(total_size <= _scoped_vmem_capacity_bytes() * utilize_ratio)
 
-    # Get the TPU scoped VMEM size. Default to half of the VMEM capacity.
-    tpu_info = pltpu.get_tpu_info()
-    scoped_vmem_capacity = tpu_info.vmem_capacity_bytes / 2
-    if tpu_info.generation == 6:
-      scoped_vmem_capacity /= 2
-    elif tpu_info.generation == 5:
-      scoped_vmem_capacity /= 4
-    return total_size <= scoped_vmem_capacity * utilize_ratio
+  def _tgmm_vmem_bytes(
+      self,
+      tiling: tuple[int, int, int],
+      *,
+      lhs_dtype: jax.typing.DTypeLike,
+      rhs_dtype: jax.typing.DTypeLike,
+      out_dtype: jax.typing.DTypeLike,
+      input_buffer_count: int,
+  ) -> int:
+    """Returns the estimated scoped VMEM usage of `backend.tgmm`."""
+    tile_m, tile_k, tile_n = tiling
+    # Quantized input tiles are bounded by the bfloat16 tile size.
+    lhs_tile = tile_m * tile_k * max(jnp.dtype(lhs_dtype).itemsize, 2)
+    rhs_tile = tile_m * tile_n * max(jnp.dtype(rhs_dtype).itemsize, 2)
+    # Pipeline buffers for both tiles, plus the masked and transposed copies of
+    # the lhs tile made in the kernel.
+    inputs = input_buffer_count * (lhs_tile + rhs_tile) + 2 * lhs_tile
+    # Double-buffered output tile, plus the float32 accumulator.
+    outputs = tile_k * tile_n * (2 * jnp.dtype(out_dtype).itemsize + 4)
+    return inputs + outputs
 
-  def _deflate_tile(self, current_tile: int) -> int:
-    if current_tile <= 128:
-      return 128
+  def _deflate_tile(self, current_tile: int, num_lanes: int) -> int:
+    if current_tile <= num_lanes:
+      return num_lanes
     new_tile = current_tile // 2
-    # Ensure partial tiles are always multiples of 128
-    return max((new_tile // 128) * 128, 128)
+    # Ensure partial tiles are always multiples of the lane count.
+    return max((new_tile // num_lanes) * num_lanes, num_lanes)
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     if self.qdtype is not None:
       return Config()
-    # Currently the heuristics are only implemented for TPU7x.
-    if pltpu.get_tpu_info().generation < 7:
+    tpu_info = pltpu.get_tpu_info()
+    if tpu_info.generation < 5:
       return Config()
+    num_lanes = tpu_info.num_lanes
     lhs, rhs = ba.args
 
     dims = ba.arguments.get(
@@ -341,49 +348,52 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       (m, n), (_, k, _) = lhs.shape, rhs.shape
     elif dims == DRHS_RAGGED_DOT_DIM_NUMS:
       (m, k), (_, n) = lhs.shape, rhs.shape
-      return self._tgmm_heuristics_config(ba, m, n, k, input_buffer_count)
+      return self._tgmm_heuristics_config(
+          ba, m, n, k, input_buffer_count, num_lanes=num_lanes
+      )
     else:
       raise ValueError(UNSUPPORTED_DIMENSIONS_MSG.format(dims))
 
     # Main heuristic: start with the largest possible tile size and "deflate" it
     # until it fits within VMEM.
 
-    # Default m to 1024.
-    tile_m = min(m, 1024)
+    # Default m to 8 * num_lanes (1024 for 128 lanes).
+    tile_m = min(m, 8 * num_lanes)
     tile_n = n
     tile_k = k
-    # Deflate m, min size for m is 128.
+    # Deflate m, min size for m is num_lanes.
     while (
         not self._fit_within_tpu_vmem(
             [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
             (tile_m, tile_n, lhs.dtype),
             input_buffer_count,
         )
-        and tile_m > 128
+        and tile_m > num_lanes
     ):
-      tile_m = self._deflate_tile(tile_m)
+      tile_m = self._deflate_tile(tile_m, num_lanes)
 
-    # Deflate n, min size for n is 128.
+    # Deflate n, min size for n is num_lanes.
     while (
         not self._fit_within_tpu_vmem(
             [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
             (tile_m, tile_n, lhs.dtype),
             input_buffer_count,
         )
-        and tile_n > 128
+        and tile_n > num_lanes
     ):
-      tile_n = self._deflate_tile(tile_n)
+      tile_n = self._deflate_tile(tile_n, num_lanes)
 
-    # Last priority: deflate k (reduction dimension), min size for k is 128.
+    # Last priority: deflate k (reduction dimension), min size for k is
+    # num_lanes.
     while (
         not self._fit_within_tpu_vmem(
             [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
             (tile_m, tile_n, lhs.dtype),
             input_buffer_count,
         )
-        and tile_k > 128
+        and tile_k > num_lanes
     ):
-      tile_k = self._deflate_tile(tile_k)
+      tile_k = self._deflate_tile(tile_k, num_lanes)
 
     return Config(
         tile_m=tile_m,
@@ -393,49 +403,47 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     )
 
   def _tgmm_heuristics_config(
-      self, ba: op.BoundArguments, m, n, k, input_buffer_count
+      self,
+      ba: op.BoundArguments,
+      m: int,
+      n: int,
+      k: int,
+      input_buffer_count: int,
+      *,
+      num_lanes: int,
+      utilize_ratio: float = 0.75,
   ) -> Config:
     """Heuristics config for tgmm."""
+    # tgmm is lhs [m, k]^T @ rhs [m, n], reducing over the ragged dimension m.
     lhs, rhs = ba.args
-    # tgmm is lhs [m, k] @ rhs [m, n] so it is similar to gmm but transposed.
-    # the input buffer count is still 2.
-    # Reduction dimension for TGMM is m.
-    tile_k = k
-    tile_n = n
-    tile_m = min(m, 1024)  # Cap to 1024 because ragged dimension.
+    out_dtype = ba.arguments.get("preferred_element_type")
+    if out_dtype is None:
+      out_dtype = jnp.result_type(lhs.dtype, rhs.dtype)
+    vmem_budget = _scoped_vmem_capacity_bytes() * utilize_ratio
 
-    # Deflate k, min size for k is 128
-    while (
-        not self._fit_within_tpu_vmem(
-            [(tile_m, tile_k, lhs.dtype), (tile_m, tile_n, rhs.dtype)],
-            (tile_k, tile_n, lhs.dtype),
-            input_buffer_count,
-        )
-        and tile_k > 128
-    ):
-      tile_k = self._deflate_tile(tile_k)
+    def fits(tile_m: int, tile_k: int, tile_n: int) -> bool:
+      vmem_bytes = self._tgmm_vmem_bytes(
+          (tile_m, tile_k, tile_n),
+          lhs_dtype=lhs.dtype,
+          rhs_dtype=rhs.dtype,
+          out_dtype=out_dtype,
+          input_buffer_count=input_buffer_count,
+      )
+      return vmem_bytes <= vmem_budget
 
-    # Deflate n, min size for n is 128
-    while (
-        not self._fit_within_tpu_vmem(
-            [(tile_m, tile_k, lhs.dtype), (tile_m, tile_n, rhs.dtype)],
-            (tile_k, tile_n, lhs.dtype),
-            input_buffer_count,
-        )
-        and tile_n > 128
-    ):
-      tile_n = self._deflate_tile(tile_n)
-
-    # Last priority: deflate m (reduction dimension), min size for m is 128
-    while (
-        not self._fit_within_tpu_vmem(
-            [(tile_m, tile_k, lhs.dtype), (tile_m, tile_n, rhs.dtype)],
-            (tile_k, tile_n, lhs.dtype),
-            input_buffer_count,
-        )
-        and tile_m > 128
-    ):
-      tile_m = self._deflate_tile(tile_m)
+    # The (tile_k, tile_n) output tile stays in VMEM for the whole reduction
+    # over m, and lhs and rhs are read from HBM once per n and k tile
+    # respectively. So pick the largest output tile that fits with
+    # tile_m = 2 * num_lanes, then the largest tile_m up to 8 * num_lanes that
+    # fits with it.
+    tile_m, tile_k, tile_n = min(m, 2 * num_lanes), k, n
+    while not fits(tile_m, tile_k, tile_n) and tile_k > num_lanes:
+      tile_k = self._deflate_tile(tile_k, num_lanes)
+    while not fits(tile_m, tile_k, tile_n) and tile_n > num_lanes:
+      tile_n = self._deflate_tile(tile_n, num_lanes)
+    tile_m = min(m, 8 * num_lanes)
+    while not fits(tile_m, tile_k, tile_n) and tile_m > num_lanes:
+      tile_m = self._deflate_tile(tile_m, num_lanes)
 
     return Config(
         tile_m=tile_m,

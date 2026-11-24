@@ -31,6 +31,7 @@ from tokamax._src.ops import op
 
 # Type variables used below are defined in the generic class signature.
 type Residuals = jax.Array | None
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 QArray = qwix.QArray
 AsQArray = quantization.AsQArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
@@ -203,12 +204,8 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   For use in MegaBlocks-style models: https://arxiv.org/abs/2211.15841.
 
   These parameters are GMM v2 specific:
-    rhs_scale: The rhs scale when rhs is quantized.
-    rhs_bias: The rhs bias: ragged_dot(lhs, rhs) + rhs_bias.
-    maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
-    lhs_scale: The lhs scale when maybe_quantize_lhs is True.
     zero_initialize: Whether to initialize unvisited output
-      elements to zero. Defaults to True (standard behavior).
+      elements to zero. Defaults to False.
     fuse_gateup_activation: fuse_gateup_activation basically fuses these two
       steps:
         - tmp = ragged_dot(lhs, [gate, up])  # concatenate gate and up on n-dim
@@ -216,8 +213,6 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
       Currently supported activations are "silu", "gelu", and "swigluoai".
       It is different from the `activation` parameter, which is applied to the
       output of the ragged dot: activate(ragged_dot(lhs, rhs)).
-    lhs_quantization_dtype: The dtype to use for the lhs quantization.
-    rhs_quantization_dtype: The dtype to use for the rhs quantization.
   """
 
   _: dataclasses.KW_ONLY
@@ -226,27 +221,21 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   @override
   def bind(
       self,
-      lhs: jax.Array | QArray | AsQArray,
-      rhs: jax.Array | QArray | AsQArray,
+      lhs: jax.Array | QArray | AsQArray | AbstractArray,
+      rhs: jax.Array | QArray | AsQArray | AbstractArray,
       *,
-      group_sizes: jax.Array | GroupSizes | Sequence[int],
+      group_sizes: jax.Array | GroupSizes | Sequence[int] | AbstractArray,
       ragged_dot_dimension_numbers: (
           jax.lax.RaggedDotDimensionNumbers | None
       ) = None,
       precision: jax.lax.PrecisionLike = None,
       preferred_element_type: jax.typing.DTypeLike | None = None,
       return_residuals: bool = False,
-      group_offset: jax.Array | None = None,
+      group_offset: jax.Array | AbstractArray | None = None,
       activation: ActivationFunction | None = None,
       manual_axis_type: jax.sharding.ManualAxisType | None = None,
-      rhs_scale: jax.Array | None = None,
-      rhs_bias: jax.Array | None = None,
-      maybe_quantize_lhs: bool = False,
-      lhs_scale: jax.Array | None = None,
-      zero_initialize: bool = True,
+      zero_initialize: bool = False,
       fuse_gateup_activation: str | None = None,
-      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> op.BoundArguments:
 
     if ragged_dot_dimension_numbers is None:
@@ -259,7 +248,7 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
 
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
       if not isinstance(group_sizes, GroupSizes):
-        group_sizes = GroupSizes(group_sizes, lhs.shape[0])
+        group_sizes = GroupSizes(group_sizes, lhs.shape[0])  # pyrefly: ignore[bad-argument-type]
 
       if self.checkify_group_sizes:
         gs = group_sizes.value
@@ -280,14 +269,8 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         group_offset=group_offset,
         activation=activation,
         manual_axis_type=manual_axis_type,
-        rhs_scale=rhs_scale,
-        rhs_bias=rhs_bias,
-        maybe_quantize_lhs=maybe_quantize_lhs,
-        lhs_scale=lhs_scale,
         zero_initialize=zero_initialize,
         fuse_gateup_activation=fuse_gateup_activation,
-        lhs_quantization_dtype=lhs_quantization_dtype,
-        rhs_quantization_dtype=rhs_quantization_dtype,
     )
 
   @override
@@ -305,46 +288,28 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
       activation: ActivationFunction | None = None,
       manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
-      rhs_scale: jax.Array | None = None,
-      rhs_bias: jax.Array | None = None,
-      maybe_quantize_lhs: bool = False,
-      lhs_scale: jax.Array | None = None,
-      zero_initialize: bool = True,
+      zero_initialize: bool = False,
       fuse_gateup_activation: str | None = None,
-      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, Residuals]:
-    del config  # Unused.
+    del config, zero_initialize
 
-    if (
-        group_offset is not None
-        or rhs_scale is not None
-        or rhs_bias is not None
-        or maybe_quantize_lhs
-        or lhs_scale is not None
-        or not zero_initialize
-        or fuse_gateup_activation is not None
-        or lhs_quantization_dtype is not None
-        or rhs_quantization_dtype is not None
-    ):
+    # JAX/XLA does not implement group_offset.
+    if group_offset is not None:
       raise NotImplementedError(
-          "The base XLA implementation does not support group_offset,"
-          " rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
-          " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
-          " or rhs_quantization_dtype."
+          "The base XLA implementation does not support group_offset."
       )
-
-    lhs, rhs = map(quantization.as_array, (lhs, rhs))
 
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.asarray(group_sizes.value)
+
+    lhs, rhs = map(quantization.as_array, (lhs, rhs))
+    out_dtype = preferred_element_type or jnp.result_type(lhs, rhs)
 
     # NOTE: `preferred_element_type` changes the accumulation type when using
     # `jax.lax.Precision`. It would be easier to always convert the precision to
     # `DotAlgorithmPreset`, but `ragged_dot_general` doesn't yet support
     # `DotAlgorithmPreset` (https://github.com/jax-ml/jax/issues/32207).
     # TODO: Remove once the above is fixed.
-    out_dtype = preferred_element_type or jnp.result_type(lhs, rhs)
     if not isinstance(precision, _DotAlgorithmLike.__value__):
       is_integer = jnp.issubdtype(out_dtype, jnp.integer)
       acc_dtype = jnp.int32 if is_integer else jnp.float32
@@ -357,6 +322,20 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         precision=precision,
         preferred_element_type=preferred_element_type,
     ).astype(out_dtype)
+
+    if fuse_gateup_activation is not None:
+      gate, up = jnp.split(dot_out, 2, axis=-1)
+      match fuse_gateup_activation:
+        case "silu":
+          dot_out = jax.nn.silu(gate) * up
+        case "gelu":
+          dot_out = jax.nn.gelu(gate) * up
+        case "gelu_tanh":
+          dot_out = jax.nn.gelu(gate, approximate=True) * up
+        case _:
+          raise NotImplementedError(
+              f"Unsupported fused activation: {fuse_gateup_activation}"
+          )
 
     residuals = dot_out
     if activation is not None:
@@ -381,39 +360,21 @@ def vjp(
     drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     # `manual_axis_type` is not used, but is expected by vjp.
     manual_axis_type: jax.sharding.ManualAxisType | None = None,
+    zero_initialize: bool = False,
     # The following are forward-only features (forwarded here by the op
     # framework because they are part of `bind`). The backward path does not
     # support quantized/biased/fused gradients, so they must be at defaults and
     # are not propagated to the `dlhs`/`drhs` sub-calls.
     group_offset: jax.Array | None = None,
-    rhs_scale: jax.Array | None = None,
-    rhs_bias: jax.Array | None = None,
-    maybe_quantize_lhs: bool = False,
-    lhs_scale: jax.Array | None = None,
-    zero_initialize: bool = True,
     fuse_gateup_activation: str | None = None,
-    lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-    rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Ragged dot VJP."""
-  del out, preferred_element_type  # Unused.
+  del out  # Unused.
 
-  if (
-      group_offset is not None
-      or rhs_scale is not None
-      or rhs_bias is not None
-      or maybe_quantize_lhs
-      or lhs_scale is not None
-      or not zero_initialize
-      or fuse_gateup_activation is not None
-      or lhs_quantization_dtype is not None
-      or rhs_quantization_dtype is not None
-  ):
+  if group_offset is not None or fuse_gateup_activation is not None:
     raise NotImplementedError(
-        "group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
-        " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
-        " rhs_quantization_dtype are not supported on the ragged_dot backward"
-        " path for now."
+        "group_offset and fuse_gateup_activation"
+        " are not supported on the ragged_dot backward path for now."
     )
 
   if activation is not None:
@@ -450,6 +411,7 @@ def vjp(
       precision=precision,
       preferred_element_type=lhs.dtype,
       manual_axis_type=jax.typeof(lhs).manual_axis_type.to_ct_mat(),
+      zero_initialize=zero_initialize,
   )
 
   dot_dim_nums = ((lhs_kept, dout_lhs_kept), (lhs_batch, dout_batch))
@@ -463,7 +425,7 @@ def vjp(
           rhs_group_dimensions=[],
       ),
       precision=precision,
-      preferred_element_type=rhs.dtype,
+      preferred_element_type=preferred_element_type,
       manual_axis_type=jax.typeof(rhs).manual_axis_type.to_ct_mat(),
   )
   return dlhs, drhs

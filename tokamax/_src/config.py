@@ -17,12 +17,44 @@
 import contextlib
 import dataclasses
 import sys
-from typing import Any
+from typing import Any, Literal
 
 from absl import flags
 import jax
 
+# Fallback behavior when `BoundArguments.default_config` misses the autotuning
+# cache (and neither an explicit `op.config` nor `NullConfig` applies):
+# - "heuristics": Return `op._get_heuristics_config(ba)` (default for the
+#   global `tokamax_autotuning_cache_miss_fallback` flag).
+# - "autotune": Run `ba.autotune()` inline over `ba.autotuning_configs`, cache
+#   the results in memory, and return the fastest config (raises
+#   `ExceptionGroup` if all candidate configs fail).
+# - "error": Raise `ValueError`.
+AutotuningCacheMissFallback = Literal["heuristics", "autotune", "error"]
+AUTOTUNING_CACHE_MISS_FALLBACKS: tuple[AutotuningCacheMissFallback, ...] = (
+    "heuristics",
+    "autotune",
+    "error",
+)
+
 _DEFAULT = object()
+
+
+def _tokamax_argv() -> list[str]:
+  """Returns `sys.argv` filtered down to the program name and Tokamax flags."""
+  argv = [sys.argv[0]]
+  args = sys.argv[1:]
+  for i, arg in enumerate(args):
+    name = arg.split("=", 1)[0].lstrip("-")
+    if not name.startswith(("tokamax_", "notokamax_")):
+      continue
+    argv.append(arg)
+    # A flag can be in 3 forms: `--tokamax_enum=b`, `--tokamax_enum b`,
+    # or `--tokamax_bool`.
+    # The condition below is for `--tokamax_enum b`.
+    if "=" not in arg and i + 1 < len(args) and not args[i + 1].startswith("-"):
+      argv.append(args[i + 1])
+  return argv
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -50,12 +82,15 @@ class _ConfigOption[T]:
   @property
   def value(self) -> T:
     if not flags.FLAGS.is_parsed():
-      # `known_only=True` parses the flags absl actually defines (so any
-      # `--tokamax_*` flags on the command line still take effect) and ignores
-      # the rest instead of raising `UnrecognizedFlagError`. Tokamax is a
-      # library, so `sys.argv` may carry flags owned by the host program
-      # (pytest's `-s`, vLLM's CLI args, etc.) that absl does not recognize.
-      flags.FLAGS(sys.argv, known_only=True)
+      # Tokamax is a library, so `sys.argv` belongs to the host program, not to
+      # us. Parsing all of it means absl interprets the host's arguments: e.g.
+      # `pytest -v -x` makes absl read `-x` as the value of its own integer
+      # `--verbosity` flag and raise. `known_only=True` does not help, because
+      # the damage is done by a flag absl does know (-v). So feed absl only the
+      # `--tokamax_*` arguments, which are unambiguously ours, and let the rest
+      # through untouched. Calling `FLAGS` marks the flags parsed, so later
+      # reads go straight to the flag values.
+      flags.FLAGS(_tokamax_argv(), known_only=True)
     return self.flag.value if (v := self.config.value) is _DEFAULT else v
 
 
@@ -63,7 +98,7 @@ autotuning_cache_miss_fallback = _ConfigOption(
     flags.DEFINE_enum(
         "tokamax_autotuning_cache_miss_fallback",
         "heuristics",
-        ("heuristics", "autotune", "error"),
+        AUTOTUNING_CACHE_MISS_FALLBACKS,
         "Fallback when no config is found in the autotuning cache by"
         " `BoundArguments.default_config` ('heuristics' - use heuristics to"
         " create a config; 'autotune' - autotune over the default autotuning"
@@ -91,5 +126,42 @@ ignore_autotuning_cache = _ConfigOption(
         False,
         "If true, ignore the autotuning cache when looking for configs and"
         " autotuning.",
+    )
+)
+
+autotuning_auto_input_layouts = _ConfigOption(
+    flags.DEFINE_bool(
+        "tokamax_autotuning_auto_input_layouts",
+        True,
+        "If true, autotuning on GPU lets XLA choose the layouts of the"
+        " benchmark inputs, as it does for the parameters of a compiled"
+        " program, and lays out the inputs to match before timing. If false,"
+        " inputs use the default layouts, so an op that reads an input"
+        " transposed (e.g. a kernel reading `rhs.mT`) is timed with a"
+        " transpose that compiled programs avoid.",
+    )
+)
+
+disable_multi_core_mode = _ConfigOption(
+    flags.DEFINE_bool(
+        "tokamax_disable_multi_core_mode",
+        False,
+        "Temporary flag to disable multi-core execution in GMM/TGMM v2 kernels"
+        " and fall back to the legacy pl.pallas_call path to unblock jax.vmap."
+        " TODO: Revert this flag once Tokamax updates its JAX"
+        " version.",
+    )
+)
+
+kda_chain_precision = _ConfigOption(
+    flags.DEFINE_enum(
+        "tokamax_kda_chain_precision",
+        "highest",
+        ("highest", "high", "default"),
+        "Matmul precision for the serial recurrent chain of the KDA Pallas"
+        " Mosaic TPU forward kernel (`w @ h` and `kg^T @ v_new`) and the"
+        " `(S, M)` / `(dS, dM)` context-parallel summary chains. Lower"
+        " precision uses fewer MXU passes, but errors compound across chunks,"
+        " so validate accuracy on TPU.",
     )
 )

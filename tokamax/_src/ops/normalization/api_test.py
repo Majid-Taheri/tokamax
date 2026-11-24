@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from collections.abc import Callable, Mapping
 import functools
 import typing
 from typing import Final
@@ -25,18 +24,11 @@ import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
 from tokamax._src.ops.normalization import api
-from tokamax._src.ops.normalization import base
-from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.normalization import test_base
 
 _IMPLEMENTATIONS: Final[tuple[str | None, ...]] = typing.get_args(
     api.Implementation.__value__
 ) + (None,)
-
-_IMPLEMENTATIONS_VJP: Mapping[str, Callable[..., jax.Array]] = dict(
-    xla=base.NormalizationVjp(),
-    triton=pl_norm_vjp.PallasTritonNormalizationVjp(),
-)
 
 import sys
 from absl import flags
@@ -58,6 +50,9 @@ class LayerNormTest(parameterized.TestCase):
   def test_basic_api(self, implementation):
     if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
+    # The Mosaic GPU normalization kernel needs no Hopper-only feature.
+    if implementation == "mosaic" and not gpu_utils.has_mosaic_gpu_support():
+      self.skipTest("Mosaic GPU not supported on this platform.")
 
     x, scale, offset = _get_input_data(shape=(128, 32), dtype=jnp.bfloat16)
 
@@ -84,7 +79,7 @@ class LayerNormTest(parameterized.TestCase):
       x_shape = jax.ShapeDtypeStruct((a, 32), x.dtype)
       param_shape = jax.ShapeDtypeStruct(scale.shape, x.dtype)
 
-      if implementation == "triton":
+      if implementation in ("triton", "mosaic"):
         with self.assertRaisesRegex(Exception, "all implementations failed"):
           export.export(
               norm_fn,
@@ -108,7 +103,9 @@ class LayerNormTest(parameterized.TestCase):
           include_xla_kernels=(implementation == "xla"),
       )
       triton_impl = type(api.IMPLEMENTATIONS.get("triton"))
-      triton_vjp_impl = type(_IMPLEMENTATIONS_VJP["triton"])
+      triton_vjp_impl = type(
+          getattr(api.IMPLEMENTATIONS.get("triton"), "vjp", None)
+      )
       match implementation:
         case "triton":
           self.assertIsInstance(opspecs[0].op, triton_impl)
@@ -130,7 +127,7 @@ class LayerNormTritonTest(test_base.NormalizationTestBase):
       norm_fn = functools.partial(api.layer_norm, implementation="xla")
       super().__init__(*args, norm_fn=norm_fn)
     else:
-      norm_fn = functools.partial(api.layer_norm, implementation=self.IMPL)
+      norm_fn = functools.partial(api.layer_norm, implementation=self.IMPL)  # pyrefly: ignore[bad-argument-type]
       super().__init__(*args, norm_fn=norm_fn)
 
 
@@ -138,7 +135,7 @@ class LayerNormXlATest(test_base.NormalizationTestBase):
   IMPL = "xla"
 
   def __init__(self, *args):
-    norm_fn = functools.partial(api.layer_norm, implementation=self.IMPL)
+    norm_fn = functools.partial(api.layer_norm, implementation=self.IMPL)  # pyrefly: ignore[bad-argument-type]
     super().__init__(*args, norm_fn=norm_fn)
 
 

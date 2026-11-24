@@ -51,7 +51,7 @@ jobs:
     if: |-
       (
         github.event_name == 'pull_request' &&
-        github.event.pull_request.head.repo.fork == false &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
         github.event.pull_request.draft == false &&
         github.event.sender.type == 'User' &&
         !startsWith(github.event.pull_request.head.ref, 'test_')
@@ -117,7 +117,7 @@ jobs:
           gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
           gemini_debug: '${{ vars.DEBUG == ''true'' || vars.ACTIONS_STEP_DEBUG == ''true'' }}'
           # The GEMINI_MODEL repository variable overrides this default.
-          gemini_model: '${{ vars.GEMINI_MODEL || ''gemini-4-neon'' }}'
+          gemini_model: '${{ vars.GEMINI_MODEL || ''gemini-4-hydrogen'' }}'
           google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
           use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
           use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
